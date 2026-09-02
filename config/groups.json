@@ -1,0 +1,14 @@
+{
+  "settlement_location": {
+    "nppd": ["NPPD_BPWN_NPPD"],
+    "kmea": ["KMEA_EMP2_SECI"],
+    "core": ["@nppd", "@kmea"],
+    "default": ["@core"]
+  },
+  "reserve_zone": {
+    "nppd_zone": ["5"],
+    "numbered": ["1", "2", "3", "4", "5", "21"],
+    "spp": ["SPP", "SWPW"],
+    "default": ["@numbered", "@spp"]
+  }
+}

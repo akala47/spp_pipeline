@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spp-pipeline"
+version = "2.0.0"
+description = "SPP market data ingestion: HTTP extract, idempotent Postgres load, forward-fill"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "requests>=2.31",
+    "psycopg2-binary>=2.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "sqlglot>=25.0"]
+airflow = ["apache-airflow>=2.9"]
+
+[project.scripts]
+spp-run = "spp.run:main"
+
+[tool.setuptools]
+packages = ["spp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
