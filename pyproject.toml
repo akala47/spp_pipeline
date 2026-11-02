@@ -11,17 +11,20 @@ dependencies = [
     "pandas>=2.0",
     "requests>=2.31",
     "psycopg2-binary>=2.9",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "sqlglot>=25.0"]
 airflow = ["apache-airflow>=2.9"]
+# SCADA scrapers (Beatrice in Airflow, Garden City on the VPN device)
+scada = ["selenium>=4.20"]
 
 [project.scripts]
 spp-run = "spp.run:main"
 
 [tool.setuptools]
-packages = ["spp"]
+packages = ["spp", "spp.scada"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: spp-pipeline
+Version: 2.0.0
+Summary: SPP market data ingestion: HTTP extract, idempotent Postgres load, forward-fill
+Requires-Python: >=3.11
+Requires-Dist: pandas>=2.0
+Requires-Dist: requests>=2.31
+Requires-Dist: psycopg2-binary>=2.9
+Requires-Dist: python-dotenv>=1.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: sqlglot>=25.0; extra == "dev"
+Provides-Extra: airflow
+Requires-Dist: apache-airflow>=2.9; extra == "airflow"
+Provides-Extra: scada
+Requires-Dist: selenium>=4.20; extra == "scada"

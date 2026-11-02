@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Garden City SCADA scraper on the VPN Mac. Keeps `python -m spp.scada.garden_city`
+  running and restarts it if it exits. Connect the site VPN first. While the VPN
+  is down, the scraper waits and tries again (same loop as the old script).
+
+  Edit the two /Users/CHANGE_ME/... paths, then:
+    cp deploy/launchd/com.valuehash.scada-garden-city.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.valuehash.scada-garden-city.plist
+  Stop:  launchctl unload ~/Library/LaunchAgents/com.valuehash.scada-garden-city.plist
+  Logs:  logs/gc_scraper.log and logs/current_mw_log.txt in the repo, and the stdout/stderr files below.
+  Settings (SPP_DSN, GC_*) are read from the repo's .env.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.valuehash.scada-garden-city</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/CHANGE_ME/spp_data_pipeline</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/CHANGE_ME/spp_data_pipeline/.venv/bin/python</string>
+        <string>-m</string>
+        <string>spp.scada.garden_city</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SCADA_LOG_FILE</key>
+        <string>logs/gc_scraper.log</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/scada-garden-city.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/scada-garden-city.err.log</string>
+</dict>
+</plist>

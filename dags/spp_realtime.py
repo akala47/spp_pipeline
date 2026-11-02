@@ -25,19 +25,21 @@ per interval regardless of how many groups are listed.
 """
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime, timedelta
 
 import pendulum
-from airflow.sdk import dag, task, Variable
-from airflow.exceptions import AirflowSkipException
-from datetime import datetime, timedelta
-import time
+from airflow.sdk.exceptions import AirflowSkipException
+from airflow.sdk import Variable, dag, task
+
 from spp import http
 from spp.run import ingest
-import os
+from spp.spine import interval_begin
+from spp.timing import RT_PERIOD, to_central_naive
 
 CENTRAL = pendulum.timezone("US/Central")
-INTERVAL = timedelta(minutes=5)
+INTERVAL = RT_PERIOD
 # Fire at :02 past, wait out the remaining seconds, then attempt.
 # SPP publishes ~2m10-2m15s after the interval begins.
 START_OFFSET_SECONDS = int(os.getenv("SPP_START_OFFSET_SECONDS", "15"))
@@ -58,17 +60,13 @@ def _groups_for(feed_name: str) -> list[str] | None:
 
 
 def _target(data_interval_end) -> datetime:
-    """Interval-beginning to ingest, floored to the 5-minute grid.
+    """Interval-BEGINNING (Central) to ingest, floored to the 5-minute grid.
 
     The schedule fires at :02 past, so data_interval_end is e.g. 10:37,
-    which floors to 10:35.
+    which floors to 10:35: the interval 10:35-10:40. SPP names that file by
+    its ENDING time (...1040.csv); feeds._rt_path adds the 5 minutes.
     """
-    end = data_interval_end.in_timezone(CENTRAL).replace(tzinfo=None)
-    return end - timedelta(
-        minutes=end.minute % 5,
-        seconds=end.second,
-        microseconds=end.microsecond,
-    )
+    return interval_begin(to_central_naive(data_interval_end))
 
 
 def _build(feed_name: str, description: str):

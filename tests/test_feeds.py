@@ -27,7 +27,7 @@ ZONE_5 = Selection.from_members(RESERVE_ZONE, ["5"], "nppd_zone")
 
 def _lmp(csv, selection):
     return parse_lmp(csv, datetime(2026, 7, 22), selection,
-                     shift=timedelta(hours=1), feed="da_lmp")
+                     period=timedelta(hours=1), feed="da_lmp")
 
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +147,9 @@ def test_urls_are_wellformed(name):
 
 
 def test_rt_midnight_uses_previous_day_folder():
-    url = FEEDS["rt_lmp"].url(datetime(2026, 7, 21, 0, 0))
+    # Interval-beginning 23:55 on Jul 20 ends at 00:00 Jul 21; SPP files that
+    # midnight-ending interval under the Jul 20 folder.
+    url = FEEDS["rt_lmp"].url(datetime(2026, 7, 20, 23, 55))
     assert "%2F07%2FBy_Interval%2F20%2F" in url
     assert url.endswith("RTBM-LMP-SL-202607210000.csv")
 
@@ -202,15 +204,15 @@ def test_gmt_not_in_fact_columns_but_parsed():
 
 
 # --------------------------------------------------------------------------- #
-# partitioned tables: ON CONFLICT must name the partition key
+# conflict keys: timestamp_id leads every natural key, and is the RT
+# partition key, which Postgres requires in every unique constraint.
 # --------------------------------------------------------------------------- #
-def test_partitioned_feeds_include_interval_in_conflict_key():
-    # Postgres requires the partition key in every unique constraint, so the
-    # RT upserts must conflict on (timestamp_id, dimension, interval_central).
+def test_every_feed_conflicts_on_timestamp_id():
     for feed in FEEDS.values():
-        if feed.partitioned:
-            assert "interval_central" in feed.conflict_keys
-            assert feed.dimension in feed.conflict_keys
+        assert feed.conflict_keys[0] == "timestamp_id"
+        assert "interval_central" not in feed.conflict_keys
+        if feed.dimension:
+            assert feed.conflict_keys == ("timestamp_id", feed.dimension)
 
 
 # --------------------------------------------------------------------------- #
@@ -224,7 +226,10 @@ _FIX = _os.path.join(_os.path.dirname(__file__), "fixtures")
 
 
 def _fixture(name):
-    with open(_os.path.join(_FIX, f"{name}_sample.csv"), "rb") as fh:
+    path = _os.path.join(_FIX, f"{name}_sample.csv")
+    if not _os.path.exists(path):
+        pytest.skip(f"fixture {name}_sample.csv not in tests/fixtures")
+    with open(path, "rb") as fh:
         return fh.read()
 
 
@@ -264,7 +269,8 @@ def test_real_hourly_load_long_format_pivots_and_sums():
     rows = FEEDS["hourly_load"].parse(_fixture("hourly_load"), datetime(2026, 7, 18))
     assert len(rows) == 1
     r = rows[0]
-    assert r["interval_central"] == datetime(2026, 7, 18, 5, 0)   # 06:00 -> 05:00
+    # 06:00 GMT hour-ending = 01:00 CDT hour-ending -> 00:00 Central beginning
+    assert r["interval_central"] == datetime(2026, 7, 18, 0, 0)
     assert abs(r["nppd"] - (3686.212 + 165.787)) < 0.001          # CF + NC summed
     assert r["csws"] == 6170.903
 

@@ -12,6 +12,11 @@
     # backfill a range for one group
     python -m spp.run --feed rt_lmp --start 2026-07-20 --end 2026-07-21 --groups nppd
 
+    # dates are OPERATING days (the date of the prints) by default. With
+    # --by-run-date they are run days, converted per feed (spp/timing.py):
+    #   da_lmp / da_mcp: run day + 1      hourly_load: run day - 1
+    python -m spp.run --feed da_lmp --start 2026-11-01 --by-run-date   # loads Nov 2
+
     # forward-fill instead of ingesting
     python -m spp.run --feed rt_lmp --fill --start 2026-07-21
 
@@ -33,6 +38,7 @@ from . import db, http
 from .feeds import FEEDS, Feed, Row
 from .logging_setup import bind, get_logger, new_run_id, timed
 from .selection import Selection, selections_for_env
+from .timing import midnight
 
 log = get_logger("spp.run")
 
@@ -191,8 +197,8 @@ def _load_one(payload: bytes, interval: datetime, feed: Feed,
 def _prepare(rows: list[Row], feed: Feed) -> list[Row]:
     """Project each row to the target columns plus provenance and interval.
 
-    interval_central resolves the timestamp_id FK in the upsert and is stored.
-    gmt_interval_begin is carried through but is NOT a fact column — db.py uses
+    interval_central is stored, and db.upsert_rows derives timestamp_id (the
+    spine id) from it. gmt_interval_begin is carried through but is NOT a fact column — db.py uses
     it to correct timestamps.ts_gmt, then the upsert ignores it.
 
     Every ingested row is stamped source='published' / is_forward_filled=false
@@ -214,11 +220,12 @@ def _prepare(rows: list[Row], feed: Feed) -> list[Row]:
 def run_range(feed_name: str, start_day: date, end_day: date, *,
               groups: Sequence[str] | None = None,
               members: Sequence[str] | None = None,
-              strict: bool = False) -> int:
+              strict: bool = False, fail_on_errors: bool = False) -> int:
     """Ingest every interval a feed produces across [start_day, end_day].
 
-    One entrypoint for both the daily schedule (start=end=today) and historical
-    backfills (a wider range). Iterates at the feed's own cadence.
+    start_day / end_day are OPERATING days (the dates of the prints), both
+    included. Iterates at the feed's own cadence: 288 RT intervals per day
+    (interval-beginning 00:00 .. 23:55), or one daily file per day.
     """
     feed = FEEDS[feed_name]
     run_id = new_run_id()
@@ -226,11 +233,12 @@ def run_range(feed_name: str, start_day: date, end_day: date, *,
 
     day = start_day
     while day <= end_day:
-        day_start = datetime(day.year, day.month, day.day)
-        if feed.cadence == "5min":
-            steps = [day_start + timedelta(minutes=5 * i) for i in range(288)]
+        day_start = midnight(day)
+        if feed.periods_per_run == 1:
+            per_day = int(timedelta(days=1) / feed.period)
+            steps = [day_start + i * feed.period for i in range(per_day)]
         else:
-            # DA/load: one file per day. The ingest target is the day itself.
+            # DA/load: one file per operating day. The target is the day itself.
             steps = [day_start]
         for target in steps:
             try:
@@ -252,6 +260,10 @@ def run_range(feed_name: str, start_day: date, end_day: date, *,
                     "start": start_day.isoformat(), "end": end_day.isoformat(),
                     "rows_written": total, "not_published": skipped,
                     "failed_intervals": failures})
+    if failures and fail_on_errors:
+        raise PartialRunFailure(
+            f"{feed_name}: {failures} interval(s) failed between {start_day} "
+            f"and {end_day}; {total} rows written. Run the range again.")
     return total
 
 
@@ -273,9 +285,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Date-range model: --start required for a run, --end optional.
     ap.add_argument("--start", type=_parse_date,
-                    help="first day to process (YYYY-MM-DD)")
+                    help="first OPERATING day (date of the prints) to process, "
+                         "YYYY-MM-DD")
     ap.add_argument("--end", type=_parse_date,
-                    help="last day to process; defaults to --start (single day)")
+                    help="last operating day, included; defaults to --start")
+    ap.add_argument("--by-run-date", action="store_true",
+                    help="--start/--end are RUN days, as in the schedule: "
+                         "da_* loads run day + 1, hourly_load run day - 1")
 
     # Forward-fill: fill gaps for a day/range instead of ingesting.
     ap.add_argument("--fill", action="store_true",
@@ -319,6 +335,13 @@ def main(argv: list[str] | None = None) -> int:
     end_day = args.end or args.start
     if end_day < start_day:
         ap.error("--end must not be before --start")
+    if args.by_run_date:
+        start_day, end_day = (feed.operating_day(start_day),
+                              feed.operating_day(end_day))
+        log.info("run days converted to operating days",
+                 extra={"event": "run.by_run_date", "feed": feed.name,
+                        "start": start_day.isoformat(),
+                        "end": end_day.isoformat()})
 
     try:
         if args.fill:
@@ -331,14 +354,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             total = run_range(args.feed, start_day, end_day,
                               groups=args.groups, members=args.members,
-                              strict=not args.no_strict)
+                              strict=not args.no_strict, fail_on_errors=True)
             print(f"{args.feed}: {total} rows ingested ({start_day} .. {end_day})")
     except http.FileNotPublished:
         log.error("upstream file not available",
                   extra={"event": "run.not_published", "feed": args.feed})
         return 2
-    except Exception:
+    except Exception as exc:
         log.exception("run failed", extra={"event": "run.error", "feed": args.feed})
+        print(f"{args.feed}: FAILED: {exc}", file=sys.stderr)
         return 1
     finally:
         http.close()

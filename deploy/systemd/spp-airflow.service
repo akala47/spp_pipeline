@@ -1,0 +1,26 @@
+# systemd USER unit: start the Astro (Airflow) stack at boot, as the non-root
+# user that owns the project. See DEPLOY_VPS.md, step 9.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/spp-airflow.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now spp-airflow.service
+#   sudo loginctl enable-linger "$USER"      # one time: start without a login
+#
+# %h is the user's home directory. Change the path if the project is not in
+# ~/spp_data_pipeline.
+[Unit]
+Description=SPP data pipeline (Astro / Airflow in Docker)
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/spp_data_pipeline
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env astro dev start --no-browser
+ExecStop=/usr/bin/env astro dev stop
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

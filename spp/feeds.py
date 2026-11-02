@@ -11,12 +11,14 @@ None for feeds that aren't subsettable). Parsers take a `Selection` and filter
 to its members, so one downloaded payload can be loaded for one group or
 several without re-fetching. See `spp/selection.py`.
 
-Timestamp convention
---------------------
+Timestamp convention (see spp/timing.py)
+----------------------------------------
 SPP publishes `Interval` as the interval *ending* time in Central, and
-`GMTIntervalEnd` alongside it. Everything downstream in this warehouse is keyed
-on interval *beginning*, so each parser shifts back by one period (1 hour for
-hourly feeds, 5 minutes for RT) and renames the GMT column accordingly.
+`GMTIntervalEnd` alongside it. Everything in this warehouse is keyed on
+interval *beginning*, so each parser subtracts the feed's `period` (5 minutes
+for RT, 1 hour for DA and hourly load) and renames the GMT column. Each feed
+also declares `run_day_offset`: the operating day it loads, relative to the
+run day (DA +1, hourly load -1, RT 0).
 
 `hourly_load` is the exception, because SPP changed its format. See
 `parse_hourly_load` — the older wide files carry a GMT hour-ending column and
@@ -42,7 +44,7 @@ from __future__ import annotations
 import io
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo
 
@@ -51,6 +53,8 @@ import pandas as pd
 from .config import SPP_PORTAL
 from .logging_setup import get_logger
 from .selection import RESERVE_ZONE, SETTLEMENT_LOCATION, Selection
+from .timing import (DA_OFFSET_DAYS, HOURLY_LOAD_OFFSET_DAYS, HOURLY_PERIOD,
+                     RT_OFFSET_DAYS, RT_PERIOD, begin_from_end, end_from_begin)
 
 log = get_logger("spp.feeds")
 
@@ -139,16 +143,17 @@ def _find_column(df: pd.DataFrame, *candidates: str) -> str | None:
     return None
 
 
-def _to_interval_begin(df: pd.DataFrame, shift: timedelta) -> pd.DataFrame:
-    """Naive-parse the two timestamp columns and shift to interval-beginning.
+def _to_interval_begin(df: pd.DataFrame, period: timedelta) -> pd.DataFrame:
+    """Parse the two timestamp columns and move them to interval-beginning.
 
-    Both columns move together: `Interval` is Central wall-clock and
-    `GMTIntervalEnd` is UTC, and shifting each by the same period keeps the
-    pair consistent without needing a timezone conversion.
+    `Interval` is Central wall-clock and `GMTIntervalEnd` is UTC, both
+    interval-ENDING. Both move back by the same period (timing.begin_from_end),
+    so the pair stays consistent without a timezone conversion.
     """
     df = df.rename(columns={"GMTIntervalEnd": "gmt_interval_begin"})
-    df["interval_central"] = pd.to_datetime(df["Interval"]) - shift
-    df["gmt_interval_begin"] = pd.to_datetime(df["gmt_interval_begin"]) - shift
+    df["interval_central"] = begin_from_end(pd.to_datetime(df["Interval"]), period)
+    df["gmt_interval_begin"] = begin_from_end(
+        pd.to_datetime(df["gmt_interval_begin"]), period)
     return df
 
 
@@ -176,7 +181,7 @@ def _apply_selection(df: pd.DataFrame, column: str, selection: Selection,
 
 
 def parse_lmp(payload: bytes, ts: datetime, selection: Selection, *,
-              shift: timedelta, feed: str) -> list[Row]:
+              period: timedelta, feed: str) -> list[Row]:
     df = _read_csv(payload)
     df = _resolve_columns(df, ["Interval", "GMTIntervalEnd",
                                "Settlement Location", "LMP", "MLC", "MCC",
@@ -193,7 +198,7 @@ def parse_lmp(payload: bytes, ts: datetime, selection: Selection, *,
         raise KeyError(f"{feed}: missing columns ['Pnode']")
 
     df = _apply_selection(df, "Settlement Location", selection, feed)
-    df = _to_interval_begin(df, shift)
+    df = _to_interval_begin(df, period)
     return [
         {
             "interval_central": r["interval_central"].to_pydatetime(),
@@ -215,7 +220,7 @@ def parse_da_mcp(payload: bytes, ts: datetime, selection: Selection) -> list[Row
                                "RegUP", "RegDN", "Spin", "Supp", "RampUP",
                                "RampDN", "UncUP"], "da_mcp")
     df = _apply_selection(df, "Reserve Zone", selection, "da_mcp")
-    df = _to_interval_begin(df, timedelta(hours=1))
+    df = _to_interval_begin(df, HOURLY_PERIOD)
     return [
         {
             "interval_central": r["interval_central"].to_pydatetime(),
@@ -237,7 +242,7 @@ def parse_rt_mcp(payload: bytes, ts: datetime, selection: Selection) -> list[Row
                                "RegDNMile", "Spin", "Supp", "RampUP", "RampDN",
                                "UncUP"], "rt_mcp")
     df = _apply_selection(df, "Reserve Zone", selection, "rt_mcp")
-    df = _to_interval_begin(df, timedelta(minutes=5))
+    df = _to_interval_begin(df, RT_PERIOD)
     return [
         {
             "interval_central": r["interval_central"].to_pydatetime(),
@@ -272,21 +277,21 @@ def parse_hourly_load(payload: bytes, ts: datetime,
         One row per (Market Hour, Control Zone Name, Forecast Area Type)
         carrying a single 'Load MW'. A zone's load is split across
         forecast-area-types (CF conforming / NC non-conforming) and must be
-        SUMMED, then pivoted long -> wide. 'Market Hour' is CENTRAL wall-clock,
-        hour-ending. No GMT column, so `db.sync_timestamps` computes ts_gmt
-        from the America/Chicago rules.
+        SUMMED, then pivoted long -> wide.
 
     WIDE (-2025)
         'MarketHour' plus one column per utility. No pivot needed, and earlier
-        files carry only 17 of the 20 zones. 'MarketHour' is GMT, hour-ending:
-        the Central day starts at 07:00Z under CST and 06:00Z under CDT, so a
-        fixed offset is wrong for half the year and this branch converts
-        properly. It also emits gmt_interval_begin, which means backfilling
-        this feed corrects timestamps.ts_gmt from real published data rather
-        than from a computed value.
+        files carry only 17 of the 20 zones.
+
+    In BOTH shapes the hour column is GMT, hour-ending. The file for
+    operating day Oct 31 2026 (CDT) runs from 10/31 06:00 to 11/01 05:00 GMT;
+    a CST day runs from 07:00 to 06:00 GMT. A fixed offset is wrong for half
+    the year, so the parser subtracts one hour as an instant and then converts
+    to America/Chicago. It also emits gmt_interval_begin, so a load of this
+    feed writes the published GMT time to timestamps.ts_gmt.
 
     Both shapes produce one row per hour with a column per utility, keyed on
-    interval-beginning.
+    interval-beginning Central time.
     """
     df = _read_csv(payload)
     is_long = _find_column(df, "Control Zone Name") is not None
@@ -301,23 +306,27 @@ def parse_hourly_load(payload: bytes, ts: datetime,
         wide = agg.pivot(index="Market Hour", columns="Control Zone Name",
                          values="Load MW").reset_index()
         hour_col = "Market Hour"
-        # Central wall-clock, hour-ending -> hour-beginning.
-        wide["interval_central"] = (
-            pd.to_datetime(wide[hour_col]) - pd.Timedelta(hours=1)
-        )
-        has_gmt = False
     else:
         wide = _resolve_columns(df, ["MarketHour"], "hourly_load")
         hour_col = "MarketHour"
-        # GMT, hour-ending. Shift as an instant, then convert, so the
-        # CST/CDT boundary lands on the right Central hour.
-        gmt_end = pd.to_datetime(wide[hour_col], utc=True)
-        gmt_begin = gmt_end - pd.Timedelta(hours=1)
-        wide["gmt_interval_begin"] = gmt_begin.dt.tz_localize(None)
-        wide["interval_central"] = (
-            gmt_begin.dt.tz_convert(CENTRAL).dt.tz_localize(None)
+
+    # GMT, hour-ending -> hour-beginning (as an instant) -> Central wall clock.
+    gmt_begin = begin_from_end(pd.to_datetime(wide[hour_col], utc=True),
+                               HOURLY_PERIOD)
+    wide["gmt_interval_begin"] = gmt_begin.dt.tz_localize(None)
+    wide["interval_central"] = gmt_begin.dt.tz_convert(CENTRAL).dt.tz_localize(None)
+    wide = wide.sort_values("gmt_interval_begin")
+    # DST fall-back day: 25 GMT hours, and two of them map to Central 01:00.
+    # Keep the first pass (CDT), as the spine does (README -> Known gaps).
+    repeated = wide["interval_central"].duplicated(keep="first")
+    if repeated.any():
+        log.warning(
+            "repeated Central hour on the DST fall-back day; first pass kept",
+            extra={"event": "parse.dst_repeat", "feed": "hourly_load",
+                   "dropped": [str(t) for t in wide.loc[repeated, "interval_central"]]},
         )
-        has_gmt = True
+        wide = wide[~repeated]
+    has_gmt = True
 
     derived = {hour_col, "interval_central", "gmt_interval_begin"}
     present = [u for u in LOAD_UTILITIES if u in wide.columns]
@@ -362,13 +371,26 @@ class Feed:
     conflict_keys: Sequence[str]
     cadence: str                       # "5min" | "hourly"
     periods_per_run: int               # 24 for a daily file, 1 for an RT interval
+    period: timedelta                  # SPP time minus this = interval-beginning
+    run_day_offset: int                # operating day = run day + this many days
     dimension: str | None = None       # what this feed can be subset on
     default_group: str = "default"
-    partitioned: bool = False          # RANGE-partitioned monthly on interval_central
+    partitioned: bool = False          # RANGE-partitioned monthly on timestamp_id
 
     @property
     def subsettable(self) -> bool:
         return self.dimension is not None
+
+    def operating_day(self, run_day: date) -> date:
+        """Date of the prints that a run on `run_day` loads (spp/timing.py).
+
+        da_lmp / da_mcp: +1 (Nov 1 -> Nov 2). hourly_load: -1 (Nov 1 -> Oct 31).
+        """
+        return run_day + timedelta(days=self.run_day_offset)
+
+    def run_day(self, operating_day: date) -> date:
+        """Inverse of operating_day: the day the scheduled run loads it."""
+        return operating_day - timedelta(days=self.run_day_offset)
 
     def expected_rows(self, selection: Selection | None) -> int:
         members = len(selection) if selection else 1
@@ -393,9 +415,9 @@ def _rt_path(dataset: str, prefix: str, ts: datetime) -> str:
 
     Everything in this package keys on interval-beginning; SPP names its RT
     files by interval-ending. The 10:35-beginning interval is published as
-    <prefix>-...1040.csv, so shift forward one period here.
+    <prefix>-...1040.csv, so add one period here.
     """
-    end = ts + timedelta(minutes=5)
+    end = end_from_begin(ts, RT_PERIOD)
     folder = _rt_file_date(end)
     return (
         f"{SPP_PORTAL}/{dataset}"
@@ -414,7 +436,7 @@ DA_LMP = Feed(
         f"DA-LMP-SL-{ts:%Y%m%d}0100.csv"
     ),
     parse=lambda payload, ts, sel: parse_lmp(payload, ts, sel,
-                                             shift=timedelta(hours=1),
+                                             period=HOURLY_PERIOD,
                                              feed="da_lmp"),
     columns=("timestamp_id", "interval_central",
              "settlement_location", "pnode", "lmp", "mlc", "mcc", "mec",
@@ -422,6 +444,8 @@ DA_LMP = Feed(
     conflict_keys=("timestamp_id", "settlement_location"),
     cadence="hourly",
     periods_per_run=24,
+    period=HOURLY_PERIOD,
+    run_day_offset=DA_OFFSET_DAYS,
     dimension=SETTLEMENT_LOCATION,
 )
 
@@ -439,29 +463,30 @@ DA_MCP = Feed(
     conflict_keys=("timestamp_id", "reserve_zone"),
     cadence="hourly",
     periods_per_run=24,
+    period=HOURLY_PERIOD,
+    run_day_offset=DA_OFFSET_DAYS,
     dimension=RESERVE_ZONE,
 )
 
-# NOTE on the RT conflict keys: rt_lmp / rt_mcp are RANGE-partitioned on
-# interval_central, and Postgres requires the partition key to be part of any
-# unique constraint. The natural key is therefore
-# (timestamp_id, dimension, interval_central) and ON CONFLICT must name all
-# three — naming only two raises "no unique or exclusion constraint matching
-# the ON CONFLICT specification". interval_central is functionally dependent on
-# timestamp_id, so this is a Postgres formality, not a wider key.
+# Every feed conflicts on (timestamp_id[, dimension]). rt_lmp / rt_mcp are
+# RANGE-partitioned on timestamp_id, and Postgres requires the partition key in
+# every unique constraint — timestamp_id already leads the natural key, so the
+# partitioned and unpartitioned tables share the same conflict target.
 RT_LMP = Feed(
     name="rt_lmp",
     table="rt_lmp",
     url=lambda ts: _rt_path("rtbm-lmp-by-location", "RTBM-LMP-SL", ts),
     parse=lambda payload, ts, sel: parse_lmp(payload, ts, sel,
-                                             shift=timedelta(minutes=5),
+                                             period=RT_PERIOD,
                                              feed="rt_lmp"),
     columns=("timestamp_id", "interval_central",
              "settlement_location", "pnode", "lmp", "mlc", "mcc", "mec",
              "source", "is_forward_filled"),
-    conflict_keys=("timestamp_id", "settlement_location", "interval_central"),
+    conflict_keys=("timestamp_id", "settlement_location"),
     cadence="5min",
     periods_per_run=1,
+    period=RT_PERIOD,
+    run_day_offset=RT_OFFSET_DAYS,
     dimension=SETTLEMENT_LOCATION,
     partitioned=True,
 )
@@ -475,9 +500,11 @@ RT_MCP = Feed(
              "reserve_zone", "regupservice", "regdnservice", "regupmile",
              "regdnmile", "spin", "supp", "rampup", "rampdn", "uncup",
              "source", "is_forward_filled"),
-    conflict_keys=("timestamp_id", "reserve_zone", "interval_central"),
+    conflict_keys=("timestamp_id", "reserve_zone"),
     cadence="5min",
     periods_per_run=1,
+    period=RT_PERIOD,
+    run_day_offset=RT_OFFSET_DAYS,
     dimension=RESERVE_ZONE,
     partitioned=True,
 )
@@ -495,6 +522,8 @@ HOURLY_LOAD = Feed(
     conflict_keys=("timestamp_id",),
     cadence="hourly",
     periods_per_run=24,
+    period=HOURLY_PERIOD,
+    run_day_offset=HOURLY_LOAD_OFFSET_DAYS,
     dimension=None,
 )
 

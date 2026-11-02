@@ -1,87 +1,88 @@
-# SPP pipeline — task reference
+# SPP pipeline: task reference
 
-All schedules are US/Central. Every write is an idempotent upsert, so re-running
-any task for any interval is safe.
+All schedules are in US Central time. All writes are idempotent upserts. You
+can run each task again for each interval, and you do not get duplicate rows.
+
+For the time rules, refer to README → [Time conventions](README.md#time-conventions).
+`spp/timing.py` holds these rules in code.
 
 ## Real-time feeds
 
 | DAG | Task | Schedule | What it does |
 |---|---|---|---|
-| `spp_rt_lmp` | `ingest` | `:02` past each 5-min interval | Sleeps `SPP_START_OFFSET_SECONDS` (default 15) to clear SPP's ~2m15s publication lag, fetches the RT LMP file for the interval that just closed, filters to the configured settlement locations, upserts to `rt_lmp` as `source='published'`. Retries every 10s; skips on the final attempt if still unpublished. |
-| `spp_rt_lmp` | `verify` | downstream of `ingest` | Counts rows in `rt_lmp` for that interval and raises if fewer than `periods_per_run × members`. Catches a partial load the ingest reported as success. |
-| `spp_rt_mcp` | `ingest` | `:02` past each 5-min interval | Identical, against the RT MCP file and reserve zones, writing to `rt_mcp`. |
-| `spp_rt_mcp` | `verify` | downstream of `ingest` | Same coverage check against `rt_mcp`. |
+| `spp_rt_lmp` | `ingest` | `:02` past each 5-minute interval | Waits `SPP_START_OFFSET_SECONDS` (default 15). Gets the RT LMP file for the interval that started 2 minutes before. Keeps the configured settlement locations. Writes them to `rt_lmp` with `source='published'`. Retries each 10 s. On the last attempt, if SPP did not publish the file, the task skips. |
+| `spp_rt_lmp` | `verify` | After `ingest` | Counts the rows in `rt_lmp` for the `timestamp_id` of the interval. If the count is less than `periods_per_run × members`, the task fails. This finds a partial load that `ingest` did not report. |
+| `spp_rt_mcp` | `ingest` | `:02` past each 5-minute interval | The same as `spp_rt_lmp`, for the RT MCP file and the reserve zones. Writes to `rt_mcp`. |
+| `spp_rt_mcp` | `verify` | After `ingest` | The same row-count check, on `rt_mcp`. |
+| `spp_gap_sweeper` | `sweep_rt_lmp`, `sweep_rt_mcp` | `:30` each hour | Looks at the last 6 hours. For each interval with fewer rows than the configured members, it loads the interval again. If you add a group to a Variable, the next sweep loads that group for the last 6 hours. |
 
 ## Daily feeds
 
 | DAG | Task | Schedule | What it does |
 |---|---|---|---|
-| `spp_day_ahead` | `ingest_da_lmp` | 14:00 daily | Fetches tomorrow's day-ahead LMP file, shifts hour-ending to hour-beginning, upserts 24 hours × members to `da_lmp`. 12 retries at 15 min covers publication drift to ~17:00. |
-| `spp_day_ahead` | `ingest_da_mcp` | 14:00 daily | Same for day-ahead marginal clearing prices by reserve zone → `da_mcp`. Runs in parallel with the LMP task. |
-| `spp_hourly_load` | `load` | 17:15 daily | Fetches yesterday's hourly load file and writes one row per hour with a column per utility to `hourly_load`. Handles both upstream formats — see below. `catchup=True`, so unpausing backfills from the start date. |
+| `spp_day_ahead` | `ingest_da_lmp` | 14:00 each day | Loads the DA LMP prints for **run day + 1** (a run on November 1 loads November 2). Moves hour-ending times back 1 hour. Writes 24 hours × members to `da_lmp`. 12 retries at 15-minute intervals cover a late publication until approximately 17:00. |
+| `spp_day_ahead` | `ingest_da_mcp` | 14:00 each day | The same for DA MCP by reserve zone, into `da_mcp`. Runs in parallel with `ingest_da_lmp`. |
+| `spp_hourly_load` | `load` | 17:15 each day | Loads the hourly load prints for **run day − 1** (a run on November 1 loads October 31). Writes one row for each hour, with one column for each utility, to `hourly_load`. Accepts the two file formats (refer to README). `catchup=True`: when you unpause it, Airflow runs it for each day from the start date. |
+
+## SCADA site load
+
+| DAG or process | Task | Schedule | What it does |
+|---|---|---|---|
+| `scada_beatrice` (VPS, Airflow) | `scrape` | Each minute | Starts headless Chrome, logs in to the Beatrice HMI and reads the MW value from the one-line diagram (old extract code). Writes one row to `mw_updates` with the spine id of the 5-minute interval of the reading. One retry after 10 s. No catchup: a run that occurs late would record the wrong time. |
+| `spp.scada.garden_city` (VPN device, launchd) | loop | About each minute | The same for the Garden City (Jameson) HMI, which is only available through the site VPN. Uses the loop of the old script: 60 s wait after a good reading, 5 s to 30 s wait after a failure, 5-minute pause after 5 failures in a row. Rejects values outside 0 to `GC_MW_CEIL`. |
 
 ## Manual operations
 
-Not scheduled. Run from `astro dev bash`.
+These operations do not have a schedule. Run them in the Airflow container
+(`astro dev bash`) or in a virtual environment on the VPS (refer to
+`DEPLOY_VPS.md`, step 10).
 
 | Command | What it does |
 |---|---|
-| `python -m spp.run --feed <f> --start <d> [--end <d>]` | Ingest a day or a range at the feed's own cadence. Skips intervals SPP never published. |
-| `python -m spp.run --feed <f> --fill --start <d>` | Forward-fill gaps for a day from each dimension's most recent prior value, marked `source='forward_filled'`. |
-| `python -m spp.run --feed <f> --check-db` | Verify the DSN and report the spine row count. |
-| `python -m spp.run --feed <f> --list-groups` | Print the resolved groups available for that feed. |
+| `python -m spp.run --feed <f> --start <d> [--end <d>]` | Loads one operating day or a range of operating days, at the cadence of the feed. Skips intervals that SPP did not publish. |
+| `python -m spp.run --feed <f> --start <d> --by-run-date` | The same, but `<d>` is a run day. `da_*` loads run day + 1, `hourly_load` loads run day − 1. |
+| `scripts/backfill.sh <feeds> <start> <end> [options]` | Runs the command above for each calendar month in the range, with one log file for each month in `logs/backfill/`. |
+| `python -m spp.run --feed <f> --fill --start <d> [--end <d>]` | Forward fill: puts the last earlier value of the same node or zone into each missing interval. Marks the rows `source='forward_filled'`. |
+| `python -m spp.run --feed <f> --check-db` | Makes sure that the DSN is correct and shows the number of spine rows. |
+| `python -m spp.run --feed <f> --list-groups` | Shows the groups for the feed. |
+| `python -m spp.scada.beatrice [--dry-run] [--headed]` | One Beatrice reading. |
+| `python -m spp.scada.garden_city --once [--dry-run] [--headed]` | One Garden City reading (on the VPN device). |
+| `python -m spp.scada.import_legacy dump.csv [--dry-run]` | Loads a CSV dump of the old `mw_updates` table into the new table. |
+| `make reset-dev` | DEV ONLY. Deletes all pipeline tables and makes them again (`00_reset_dev.sql`, `01_schema.sql`, `02_seed.sql`). |
 
-## How a target interval is derived
+## How a task finds its target
 
-Every task computes its target from the DAG run's own data interval, never from
-the wall clock, so retries and backfills hit the same interval regardless of the
-host's timezone.
+Each task calculates its target from `data_interval_end` of its DAG run. For
+a cron schedule in Airflow 3, this is the time at which the run starts. A task
+never uses the wall clock. Thus a retry or a catchup run loads the same target
+as the first run, on all hosts and in all time zones.
 
-| DAG | Source | Derivation |
+| DAG | Calculation | Example |
 |---|---|---|
-| `spp_rt_lmp`, `spp_rt_mcp` | `data_interval_end` | Floor to the 5-minute grid. A run firing 10:37 targets interval-beginning 10:35. |
-| `spp_day_ahead` | `data_interval_end` | Plus one day, at midnight. A run firing Sept 1 targets operating day Sept 2. |
-| `spp_hourly_load` | `data_interval_end` | Minus one day, at midnight. A run firing Sept 2 targets Sept 1. |
+| `spp_rt_lmp`, `spp_rt_mcp` | Move the run time down to the 5-minute grid | A run at 10:37 loads the interval that starts at 10:35 (SPP file `…1040.csv`) |
+| `spp_day_ahead` | Central date of the run time + 1 day | A run on November 1 loads operating day November 2 |
+| `spp_hourly_load` | Central date of the run time − 1 day | A run on November 1 loads operating day October 31 |
 
-`data_interval_end` is the run's execution time for a cron schedule;
-`data_interval_start` is one full interval earlier, and using it silently
-ingests the wrong day. `logical_date` is `None` on manual and asset-triggered
-runs in Airflow 3 and must not be used here.
+Do not use `logical_date`. In Airflow 3 it is `None` for a manual run.
 
-## Timestamp and format conventions
+## Time conventions (summary)
 
-**Interval-beginning.** SPP publishes `Interval` as the interval *ending* time;
-everything in this warehouse keys on interval *beginning*. Each parser shifts
-back one period — 5 minutes for RT, 1 hour for DA.
+- **Interval-beginning.** SPP publishes interval-ending times. Each parser
+  subtracts one period: 5 minutes for RT, 1 hour for DA and hourly load.
+- **Spine ids.** `<Excel date serial>HB<hh>MB<mm>` of the interval-beginning
+  Central time. `46268HB17MB45` is 2026-09-03 17:45.
+- **RT file names.** SPP names an RT file with the interval-ending time. The
+  URL builder adds 5 minutes. The file of the interval that ends at midnight
+  is in the folder of the previous day.
+- **Hourly load times.** `Market Hour` is GMT, hour-ending, in both file
+  formats. The parser subtracts 1 hour and converts to Central time.
+- **DA file names.** The `0100` suffix is the first hour-ending of the
+  operating day. The DA URLs do not need a shift.
 
-**RT file naming.** The RT URL builder shifts *forward* one period, because
-SPP names files by ending time: the 10:35-beginning interval is published as
-`...1040.csv`. Midnight-ending lives in the previous day's folder. The DA URLs
-need no shift — their hardcoded `0100` suffix is already SPP's first
-hour-ending of the operating day.
+## Known gaps
 
-**`hourly_load` has two upstream formats.** Files from 2026 onward are long —
-one row per (Market Hour, Control Zone Name, Forecast Area Type), summed across
-forecast-area-type and pivoted wide, with Market Hour in Central wall-clock.
-Older files are already wide, with `MarketHour` in **GMT**, and carry only 17 of
-the 20 control zones. The wide branch converts through `America/Chicago` rather
-than subtracting a fixed offset, since the Central day begins at 07:00Z under
-CST and 06:00Z under CDT. It also emits `gmt_interval_begin`, so backfilling
-this feed corrects `timestamps.ts_gmt` from real published data.
-
-**Header drift.** Column names are matched canonically — case, spaces and
-underscores ignored — so `MarketHour` / `Market Hour` and `RegUpMile` /
-`RegUPMile` both resolve. A genuinely missing column logs
-`parse.schema_drift` with the headers that were present, then raises.
-
-**Provenance.** Ingest always writes `source='published'`, so re-ingesting real
-data over a previously forward-filled row flips it back — published always wins.
-
-## Known gaps in this cut
-
-- No gap sweeper and no scheduled forward fill. Both were dropped to keep the
-  first release simple; `spp/fill.py` still works by hand.
-- The RT path has an independent `verify` task; the daily path relies only on
-  `ingest`'s `strict=True` row-count check.
-- DST days produce 23 or 25 hourly rows against an expected 24, so `strict=True`
-  fails on them. Use `--no-strict` for historical loads.
+- There is no scheduled forward fill. Run `--fill` manually.
+- The daily DAGs do not have a separate `verify` task. They use only the
+  row-count check in `ingest` (`strict=True`).
+- On a DST change day, an hourly file has 23 or 25 rows, not 24. Thus
+  `strict=True` fails on these days. Use `--no-strict` for past data.

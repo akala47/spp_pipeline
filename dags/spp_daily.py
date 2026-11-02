@@ -1,6 +1,14 @@
 """Daily feeds: DA LMP, DA MCP (posted early afternoon for the next operating
 day) and the daily hourly-load file (posted for the previous day).
 
+Run day -> operating day (spp/timing.py, Feed.operating_day):
+
+    spp_day_ahead    run on Nov 1  ->  loads the Nov 2 prints   (run day + 1)
+    spp_hourly_load  run on Nov 1  ->  loads the Oct 31 prints  (run day - 1)
+
+The run day is the Central date of data_interval_end (the run's fire time),
+never the wall clock, so retries and catchup runs load the same day.
+
 Node / zone subsets come from Airflow Variables, same as the RT DAGs:
 
     airflow variables set spp_da_lmp_groups nppd,kmea
@@ -19,6 +27,7 @@ from airflow.sdk import dag, task, Variable
 from spp import http
 from spp.feeds import FEEDS
 from spp.run import ingest
+from spp.timing import midnight, run_day
 
 CENTRAL = pendulum.timezone("US/Central")
 
@@ -45,9 +54,9 @@ def _resolve_groups(params, feed_name: str) -> list[str] | None:
         override = [g.strip() for g in override.split(",") if g.strip()]
     return override or _groups_for(feed_name)
 
-def _published(feed_name: str, target) -> bool:
-    url = FEEDS[feed_name].url(target)
-    return http.probe([url])[url] == 200
+def _target(feed_name: str, data_interval_end):
+    """Operating day (midnight, naive Central) that this run loads."""
+    return midnight(FEEDS[feed_name].operating_day(run_day(data_interval_end)))
 
 
 @dag(
@@ -68,21 +77,12 @@ def _published(feed_name: str, target) -> bool:
     params={"groups": None},
 )
 def spp_day_ahead():
-    def _target(data_interval_end):
-        """DA files published today describe tomorrow.
-
-        data_interval_end is the run's execution time for a cron schedule;
-        data_interval_start is one interval (a full day) earlier.
-        """
-        return (data_interval_end.in_timezone(CENTRAL) + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-        )
-
     @task(task_id="ingest_da_lmp")
     def da_lmp(params=None, data_interval_end=None, **_):
         groups = _resolve_groups(params, "da_lmp")
         try:
-            return ingest("da_lmp", _target(data_interval_end), groups=groups)
+            return ingest("da_lmp", _target("da_lmp", data_interval_end),
+                          groups=groups)
         finally:
             http.close()
 
@@ -90,7 +90,8 @@ def spp_day_ahead():
     def da_mcp(params=None, data_interval_end=None, **_):
         groups = _resolve_groups(params, "da_mcp")
         try:
-            return ingest("da_mcp", _target(data_interval_end), groups=groups)
+            return ingest("da_mcp", _target("da_mcp", data_interval_end),
+                          groups=groups)
         finally:
             http.close()
 
@@ -109,12 +110,10 @@ def spp_day_ahead():
 )
 def spp_hourly_load():
     @task
-    def load(data_interval_start=None, **_):
-        target = (data_interval_start.in_timezone(CENTRAL) - timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-        )
+    def load(data_interval_end=None, **_):
+        # A run on Nov 1 loads the Oct 31 file (run day - 1).
         try:
-            return ingest("hourly_load", target)
+            return ingest("hourly_load", _target("hourly_load", data_interval_end))
         finally:
             http.close()
 
@@ -148,6 +147,8 @@ def spp_gap_sweeper():
     def sweep(feed_name: str, data_interval_end=None, **_):
         from spp import db
         from spp.run import ingest as _ingest, resolve_selections
+        from spp.spine import interval_begin, spine_id
+        from spp.timing import RT_PERIOD, to_central_naive
 
         feed = FEEDS[feed_name]
         groups = _groups_for(feed_name)
@@ -157,31 +158,30 @@ def spp_gap_sweeper():
         # data_interval_end is this run's fire time, so the window really is
         # "the last 6 hours". logical_date was an hour behind on an hourly
         # schedule, leaving the most recent hour unswept.
-        end = data_interval_end.in_timezone(CENTRAL).replace(
-            second=0, microsecond=0, tzinfo=None
-        )
-        end -= timedelta(minutes=end.minute % 5)
+        end = interval_begin(to_central_naive(data_interval_end))
         start = end - timedelta(hours=6)
 
+        # Filter and group on timestamp_id: it prunes to the RT partitions the
+        # window touches and is served by the unique index.
         with db.connect() as conn, conn.cursor() as cur:
             cur.execute(
-                f"SELECT interval_central, count(*) FROM {feed.table} "
-                "WHERE interval_central >= %s AND interval_central < %s "
-                "GROUP BY interval_central",
-                (start, end),
+                f"SELECT timestamp_id, count(*) FROM {feed.table} "
+                "WHERE timestamp_id >= %s AND timestamp_id < %s "
+                "GROUP BY timestamp_id",
+                (spine_id(start), spine_id(end)),
             )
             counts = dict(cur.fetchall())
 
         repaired = []
         cursor = start
         while cursor < end:
-            if counts.get(cursor, 0) < expected:
+            if counts.get(spine_id(cursor), 0) < expected:
                 try:
                     _ingest(feed_name, cursor, groups=groups, strict=False)
                     repaired.append(cursor.isoformat())
                 except http.FileNotPublished:
                     pass
-            cursor += timedelta(minutes=5)
+            cursor += RT_PERIOD
         http.close()
         return repaired
 

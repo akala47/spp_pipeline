@@ -17,7 +17,13 @@ Three ideas carry all the weight here:
 
 3. **Partitions are created just in time.** ensure_month_partition() is called
    for the months a batch touches, so RT writes into a future month work
-   without a cron job pre-creating tables.
+   without a cron job pre-creating tables. RT tables are partitioned on
+   timestamp_id, so each month is a spine-id range.
+
+4. **timestamp_id is the access path.** Facts carry the spine id
+   (spp/spine.py), computed here from interval_central rather than looked up,
+   and every read in this package filters on timestamp_id — the column the
+   fact tables are partitioned and indexed on.
 """
 from __future__ import annotations
 
@@ -32,6 +38,7 @@ from psycopg2.extensions import AsIs, connection as Connection, register_adapter
 
 from .config import settings
 from .logging_setup import get_logger
+from .spine import spine_id
 
 log = get_logger("spp.db")
 
@@ -100,7 +107,7 @@ def sync_timestamps(conn: Connection, rows: Iterable[dict[str, Any]], *,
     """Ensure every interval in `rows` exists in timestamps, with a real ts_gmt.
 
     Called before the fact upsert. Makes the load self-seeding: an interval
-    outside the range covered by 011_partitions_and_seed.sql is created here
+    outside the range seeded by schema/02_seed.sql is created here
     rather than silently dropping the row.
     """
     pairs: dict[datetime, datetime] = {}
@@ -154,13 +161,14 @@ def upsert_rows(
 ) -> int:
     """Idempotent upsert for the v2 uniform schema.
 
-    Every fact table carries a timestamp_id FK, so there is ONE write path:
-    resolve timestamp_id by joining timestamps on interval_central, then
-    ON CONFLICT on the natural key. RT (5-min) and DA/load (hourly) differ only
-    in how many source rows they carry, not in shape — so both use this.
+    Every fact table carries a timestamp_id FK to the spine, so there is ONE
+    write path: sync the spine, stamp each row with spine_id(interval_central)
+    (deterministic, so no lookup), then INSERT ... ON CONFLICT on the natural
+    key. RT (5-min) and DA/load (hourly) differ only in how many source rows
+    they carry, not in shape — so both use this.
 
     Rows must supply every name in `columns` except timestamp_id, plus
-    interval_central (used both to resolve the FK and as a stored column).
+    interval_central. A row that already carries timestamp_id keeps it.
     """
     rows = list(rows)
     if not rows:
@@ -168,41 +176,32 @@ def upsert_rows(
                                                "feed": feed, "table": table})
         return 0
 
+    for row in rows:
+        row.setdefault("timestamp_id", spine_id(row["interval_central"]))
+
+    # The FK needs every spine row to exist before the facts reference it.
     sync_timestamps(conn, rows, feed=feed)
     if partitioned:
         ensure_partitions(conn, table, (r["interval_central"] for r in rows))
 
-    value_cols = [c for c in columns if c != "timestamp_id"]
-    placeholders = ", ".join(f"%({c})s" for c in value_cols)
+    placeholders = ", ".join(f"%({c})s" for c in columns)
     sql = f"""
-        INSERT INTO {table} (timestamp_id, {_columns_sql(value_cols)})
-        SELECT t.id, {placeholders}
-        FROM timestamps t
-        WHERE t.ts_central = %(interval_central)s
+        INSERT INTO {table} ({_columns_sql(columns)})
+        VALUES ({placeholders})
         ON CONFLICT ({_columns_sql(conflict_keys)})
         DO UPDATE SET {_update_sql(columns, conflict_keys)}
     """
     written = 0
-    unmatched = 0
     try:
         with conn.cursor() as cur:
             for row in rows:
                 cur.execute(sql, row)
-                if cur.rowcount:
-                    written += cur.rowcount
-                else:
-                    unmatched += 1
+                written += cur.rowcount
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
-    if unmatched:
-        log.error(
-            "intervals missing from timestamps table",
-            extra={"event": "load.unmatched_timestamp", "feed": feed,
-                   "table": table, "unmatched": unmatched},
-        )
     log.info("rows written", extra={"event": "load.ok", "feed": feed,
                                     "table": table, "rows_in": len(rows),
                                     "rows_written": written})
@@ -213,12 +212,15 @@ def upsert_rows(
 
 
 def coverage(conn: Connection, *, table: str, start: datetime, end: datetime) -> int:
-    """How many rows landed in a window — used by the data-quality checks."""
+    """How many rows landed in [start, end) — used by the data-quality checks.
+
+    Filters on timestamp_id, so it prunes RT partitions and uses the index.
+    """
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT count(*) FROM {table} "
-            f"WHERE interval_central >= %s AND interval_central < %s",
-            (start, end),
+            f"WHERE timestamp_id >= %s AND timestamp_id < %s",
+            (spine_id(start), spine_id(end)),
         )
         return cur.fetchone()[0]
 

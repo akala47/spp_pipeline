@@ -15,10 +15,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from load_dotenv import load_dotenv
+from dotenv import load_dotenv
+
+# Read the repo's .env (found by searching up from this file, so it works from
+# any working directory). Variables already set in the environment win, which
+# is how Airflow / Astro passes them in.
+load_dotenv()
 
 # Base of the SPP file browser. Feed URLs append `/<dataset>?path=...`.
-load_dotenv()
 SPP_PORTAL = os.environ.get("SPP_PORTAL", "https://portal.spp.org/file-browser-api/download")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

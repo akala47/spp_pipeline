@@ -13,6 +13,11 @@ Why this lives in SQL, not a Python row loop: for a whole day the fill is a
 single set-based statement per feed — find the day's expected intervals, left
 join what exists, and for each hole pull the latest earlier value with a
 lateral. One round trip instead of 288 per node.
+
+Every lookup is on timestamp_id — the column the fact tables are partitioned
+and indexed on — with the day's bounds computed in Python by spp.spine. The
+"latest earlier value" lateral walks the (dimension, timestamp_id) index
+backwards and stops at the first row.
 """
 from __future__ import annotations
 
@@ -21,12 +26,14 @@ from datetime import date, datetime, timedelta
 from . import db
 from .feeds import FEEDS, Feed
 from .logging_setup import bind, get_logger, new_run_id, timed
+from .spine import spine_id
 
 log = get_logger("spp.fill")
 
 
 def _step(feed: Feed) -> timedelta:
-    return timedelta(minutes=5) if feed.cadence == "5min" else timedelta(hours=1)
+    """Spacing of the feed's interval-beginning rows (spp/timing.py)."""
+    return feed.period
 
 
 def _measure_columns(feed: Feed) -> list[str]:
@@ -41,8 +48,8 @@ def _fill_sql(feed: Feed) -> str:
 
     For each (expected interval, dimension) with no row, take the latest earlier
     row for that dimension (published OR previously filled, so a long gap chains
-    forward) whose interval is < the hole and >= the lookback floor, copy its
-    measures, stamp it filled, and resolve timestamp_id.
+    forward) whose id is < the hole and >= the lookback floor, copy its
+    measures and stamp it filled. Intervals missing from the spine are skipped.
 
     The dimension universe is bounded to the lookback window rather than
     SELECT DISTINCT over the whole table — on a partitioned RT table that is the
@@ -55,7 +62,7 @@ def _fill_sql(feed: Feed) -> str:
 
     return f"""
     WITH expected AS (
-        SELECT g AS interval_central
+        SELECT g AS interval_central, spine_id(g) AS timestamp_id
         FROM generate_series(%(day_start)s::timestamp,
                              %(last_interval)s::timestamp,
                              %(step)s::interval) g
@@ -63,34 +70,36 @@ def _fill_sql(feed: Feed) -> str:
     dims AS (
         SELECT DISTINCT {dim} AS d
         FROM {feed.table}
-        WHERE interval_central >= %(floor)s
-          AND interval_central <  %(day_end)s
+        WHERE timestamp_id >= %(floor_id)s
+          AND timestamp_id <  %(day_end_id)s
     ),
     grid AS (
-        SELECT e.interval_central, d.d AS {dim}
+        SELECT e.timestamp_id, e.interval_central, d.d AS {dim}
         FROM expected e CROSS JOIN dims d
     ),
     holes AS (
-        SELECT grid.interval_central, grid.{dim}
+        SELECT grid.timestamp_id, grid.interval_central, grid.{dim}
         FROM grid
         LEFT JOIN {feed.table} f
-          ON f.interval_central = grid.interval_central
+          ON f.timestamp_id = grid.timestamp_id
          AND f.{dim} = grid.{dim}
+         AND f.timestamp_id >= %(day_start_id)s
+         AND f.timestamp_id <  %(day_end_id)s
         WHERE f.id IS NULL
     ),
     filled AS (
-        SELECT h.interval_central, h.{dim}, t.id AS timestamp_id, {src_measures}
+        SELECT h.timestamp_id, h.interval_central, h.{dim}, {src_measures}
         FROM holes h
+        JOIN timestamps t ON t.id = h.timestamp_id
         JOIN LATERAL (
             SELECT {set_measures}
             FROM {feed.table} prev
             WHERE prev.{dim} = h.{dim}
-              AND prev.interval_central < h.interval_central
-              AND prev.interval_central >= %(floor)s
-            ORDER BY prev.interval_central DESC
+              AND prev.timestamp_id <  h.timestamp_id
+              AND prev.timestamp_id >= %(floor_id)s
+            ORDER BY prev.timestamp_id DESC
             LIMIT 1
         ) src ON true
-        JOIN timestamps t ON t.ts_central = h.interval_central
     )
     INSERT INTO {feed.table}
         (timestamp_id, interval_central, {dim}, {set_measures},
@@ -109,28 +118,27 @@ def _fill_sql_no_dim(feed: Feed) -> str:
     src_measures = ", ".join(f"src.{c}" for c in measures)
     return f"""
     WITH expected AS (
-        SELECT g AS interval_central
+        SELECT g AS interval_central, spine_id(g) AS timestamp_id
         FROM generate_series(%(day_start)s::timestamp,
                              %(last_interval)s::timestamp,
                              %(step)s::interval) g
     ),
     holes AS (
-        SELECT e.interval_central
+        SELECT e.timestamp_id, e.interval_central
         FROM expected e
-        LEFT JOIN {feed.table} f ON f.interval_central = e.interval_central
+        LEFT JOIN {feed.table} f ON f.timestamp_id = e.timestamp_id
         WHERE f.id IS NULL
-          AND %(day_end)s::timestamp IS NOT NULL
     ),
     filled AS (
-        SELECT h.interval_central, t.id AS timestamp_id, {src_measures}
+        SELECT h.timestamp_id, h.interval_central, {src_measures}
         FROM holes h
+        JOIN timestamps t ON t.id = h.timestamp_id
         JOIN LATERAL (
             SELECT {set_measures} FROM {feed.table} prev
-            WHERE prev.interval_central < h.interval_central
-              AND prev.interval_central >= %(floor)s
-            ORDER BY prev.interval_central DESC LIMIT 1
+            WHERE prev.timestamp_id <  h.timestamp_id
+              AND prev.timestamp_id >= %(floor_id)s
+            ORDER BY prev.timestamp_id DESC LIMIT 1
         ) src ON true
-        JOIN timestamps t ON t.ts_central = h.interval_central
     )
     INSERT INTO {feed.table}
         (timestamp_id, interval_central, {set_measures}, source, is_forward_filled)
@@ -145,7 +153,7 @@ def expected_intervals(feed: Feed, day: date) -> list[datetime]:
     """The interval-beginning timestamps this feed should have on `day`."""
     start = datetime(day.year, day.month, day.day)
     step = _step(feed)
-    n = 288 if feed.cadence == "5min" else 24
+    n = int(timedelta(days=1) / step)
     return [start + i * step for i in range(n)]
 
 
@@ -160,10 +168,12 @@ def forward_fill_day(feed_name: str, day: date, *, lookback_days: int = 7,
     step = _step(feed)
     params = {
         "day_start": day_start,
-        "day_end": day_end,
         "last_interval": day_end - step,
-        "floor": day_start - timedelta(days=lookback_days),
         "step": "5 minutes" if feed.cadence == "5min" else "1 hour",
+        # Spine-id bounds: every fact-table predicate filters on timestamp_id.
+        "day_start_id": spine_id(day_start),
+        "day_end_id": spine_id(day_end),
+        "floor_id": spine_id(day_start - timedelta(days=lookback_days)),
     }
     sql = _fill_sql(feed) if feed.dimension else _fill_sql_no_dim(feed)
 

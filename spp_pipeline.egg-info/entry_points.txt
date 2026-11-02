@@ -1,0 +1,2 @@
+[console_scripts]
+spp-run = spp.run:main

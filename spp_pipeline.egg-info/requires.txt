@@ -1,0 +1,14 @@
+pandas>=2.0
+requests>=2.31
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+
+[airflow]
+apache-airflow>=2.9
+
+[dev]
+pytest>=8.0
+sqlglot>=25.0
+
+[scada]
+selenium>=4.20

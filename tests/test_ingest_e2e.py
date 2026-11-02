@@ -12,12 +12,16 @@ from datetime import datetime
 import pytest
 
 DSN = os.environ.get("SPP_TEST_DSN")
-pytestmark = pytest.mark.skipif(not DSN, reason="SPP_TEST_DSN not set")
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
+pytestmark = [
+    pytest.mark.skipif(not DSN, reason="SPP_TEST_DSN not set"),
+    pytest.mark.skipif(not os.path.exists(os.path.join(FIXTURES, "rt_lmp_sample.csv")),
+                       reason="tests/fixtures/rt_lmp_sample.csv not present"),
+]
 
 if DSN:
     os.environ.setdefault("SPP_DSN", DSN)
 
-FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 INTERVAL = datetime(2026, 7, 22, 0, 0)
 
 
