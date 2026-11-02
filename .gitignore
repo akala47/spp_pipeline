@@ -18,3 +18,7 @@ airflow.db
 local/
 logs/
 *.log
+
+# Python build and test output
+*.egg-info/
+.pytest_cache/
