@@ -214,10 +214,94 @@ sudo ufw status verbose
 
 ## 7. Get the code and set the configuration
 
+The repository is private (`akala47/spp_pipeline` on GitHub). The VPS gets
+the code with a **deploy key**: an SSH key that gives access to this one
+repository only. Use a read-only deploy key. The VPS must not push changes.
+
+### 7.1 Make a deploy key on the VPS
+
+Do these commands as `spp`:
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+ssh-keygen -t ed25519 -N "" -C "spp-vps deploy key" -f ~/.ssh/spp_pipeline_deploy
+chmod 600 ~/.ssh/spp_pipeline_deploy
+```
+
+The key has no passphrase, so that `git pull` can run with no person present.
+Do not copy the private key (`~/.ssh/spp_pipeline_deploy`) to a different
+computer.
+
+Tell SSH to use this key for this repository only. Add these lines to
+`~/.ssh/config`:
+
+```bash
+cat >> ~/.ssh/config <<'EOF'
+
+# GitHub deploy key: akala47/spp_pipeline (read-only)
+Host github-spp
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/spp_pipeline_deploy
+    IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+```
+
+`github-spp` is a name for this key only. The Git remote uses this name in
+place of `github.com` (step 7.3).
+
+### 7.2 Add the public key to GitHub
+
+1. Show the public key and copy the full line:
+
+   ```bash
+   cat ~/.ssh/spp_pipeline_deploy.pub
+   ```
+
+2. On GitHub, open the repository `akala47/spp_pipeline`. You must be an
+   administrator of the repository.
+3. Go to **Settings → Deploy keys → Add deploy key**.
+4. Set **Title** to the VPS name, for example `spp-vps-<hostname>`.
+5. Paste the public key into **Key**.
+6. Do **not** select **Allow write access**.
+7. Click **Add key**.
+
+Make sure that the VPS knows the real GitHub host key. Get the fingerprint,
+then compare it with the ED25519 fingerprint on the GitHub documentation page
+"GitHub's SSH key fingerprints":
+
+```bash
+ssh-keyscan -t ed25519 github.com 2>/dev/null | tee -a ~/.ssh/known_hosts | ssh-keygen -lf -
+```
+
+If the fingerprints are not the same, stop. Do not continue.
+
+Make sure that the key works:
+
+```bash
+ssh -T git@github-spp
+# Hi akala47/spp_pipeline! You've successfully authenticated, but GitHub does not provide shell access.
+```
+
+### 7.3 Clone the repository
+
+The default branch on GitHub is not `main`. Thus give the branch:
+
 ```bash
 cd ~
-git clone <repo-url> spp_data_pipeline
+git clone -b main git@github-spp:akala47/spp_pipeline.git spp_data_pipeline
 cd ~/spp_data_pipeline
+git config pull.ff only           # a pull never makes a merge commit on the VPS
+git status                        # On branch main, up to date with 'origin/main'
+```
+
+To get the latest version later, run `git pull` in the project folder (refer
+to step 13, "Update the code").
+
+### 7.4 Set the configuration
+
+```bash
 cp .env.example .env
 chmod 600 .env
 ```
@@ -502,10 +586,14 @@ documentation (`ssl_cert_file`, `ssl_key_file`).
 
 ### On the Garden City device
 
-1. Get the code and make a virtual environment:
+1. Get the code and make a virtual environment. Use a separate deploy key
+   for this device: do steps 7.1 to 7.3 on the device, with a different key
+   title (for example `spp-garden-city`). GitHub accepts more than one deploy
+   key for a repository.
 
    ```bash
-   git clone <repo-url> spp_data_pipeline && cd spp_data_pipeline
+   git clone -b main git@github-spp:akala47/spp_pipeline.git spp_data_pipeline
+   cd spp_data_pipeline
    python3 -m venv .venv && .venv/bin/pip install -e '.[scada]'
    cp .env.example .env && chmod 600 .env
    ```
@@ -549,10 +637,18 @@ documentation (`ssl_cert_file`, `ssl_key_file`).
 
 ```bash
 cd ~/spp_data_pipeline
-git pull
-astro dev restart            # rebuilds the image if requirements.txt or packages.txt changed
-.venv/bin/pip install -e .   # update the host virtual environment
+git pull --ff-only origin main   # uses the deploy key (step 7)
+astro dev restart                # rebuilds the image if requirements.txt or packages.txt changed
+.venv/bin/pip install -e .       # update the host virtual environment
 ```
+
+If `git pull` stops with "Not possible to fast-forward", a file on the VPS was
+changed. Do not edit tracked files on the VPS. To see the changes, run
+`git status`. To discard them, run `git restore .`, then pull again. `.env`
+is not tracked, so these commands do not change it.
+
+To remove the access of a VPS, delete its key on GitHub (**Settings → Deploy
+keys**).
 
 Airflow reads changes to the files in `dags/` without a restart.
 
@@ -610,3 +706,5 @@ pg_restore -h localhost -U spp -d spp --clean --if-exists ~/backups/spp_<date>.d
 | A setting in `.env` has no effect | Space before `=`, or no restart | Remove the space, then `astro dev restart` |
 | `SPP_DSN` is empty after `. ./.env` | The value contains `&` and has no quotes | Put the value in single quotes |
 | Disk is almost full | Airflow task logs, Docker images, backups | Step 13: clean the logs; `docker system prune`; move old backups |
+| `git clone` or `git pull`: `Permission denied (publickey)` | The deploy key is not on GitHub, or the remote does not use `github-spp` | Do step 7.2 again. `git remote -v` must show `git@github-spp:akala47/spp_pipeline.git`. |
+| `git clone` checks out the wrong branch | The default branch on GitHub is not `main` | Clone with `-b main`, or run `git checkout main` |
