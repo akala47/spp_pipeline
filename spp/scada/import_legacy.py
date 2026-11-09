@@ -42,6 +42,11 @@ _EXCEL_MANGLED = re.compile(r"^\d{1,2}:\d{2}(\.\d+)?$")
 _LOCATION = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
+# Codes in the old table that have a new name. The old single-site Garden
+# City scraper read the Jameson meter.
+RENAMED = {"GARDEN_CITY": "GC_JAMESON"}
+
+
 class BadRow(ValueError):
     pass
 
@@ -79,7 +84,8 @@ def parse_row(row: dict[str, str] | list[str], source_tz: ZoneInfo) -> Reading:
             mw = keys["mw_reading"]
         except KeyError as exc:
             raise BadRow(f"missing column {exc}") from None
-        return Reading(loc.strip(), _parse_ts(ts, source_tz), _parse_mw(mw))
+        loc = loc.strip()
+        return Reading(RENAMED.get(loc, loc), _parse_ts(ts, source_tz), _parse_mw(mw))
 
     loc = ts = mw = None
     for field in (f.strip() for f in row):
@@ -93,7 +99,7 @@ def parse_row(row: dict[str, str] | list[str], source_tz: ZoneInfo) -> Reading:
             mw = field                      # MW has decimals; the old id does not
     if loc is None or ts is None or mw is None:
         raise BadRow(f"cannot identify location / time / MW in {row!r}")
-    return Reading(loc, _parse_ts(ts, source_tz), _parse_mw(mw))
+    return Reading(RENAMED.get(loc, loc), _parse_ts(ts, source_tz), _parse_mw(mw))
 
 
 def _rows(path: str):

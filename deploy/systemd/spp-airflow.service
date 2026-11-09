@@ -7,20 +7,28 @@
 #   systemctl --user enable --now spp-airflow.service
 #   sudo loginctl enable-linger "$USER"      # one time: start without a login
 #
+# A user unit cannot wait for the system unit docker.service, so ExecStartPre
+# waits until the Docker daemon answers (maximum 5 minutes). If the start
+# fails, systemd tries again after 30 s.
+#
 # %h is the user's home directory. Change the path if the project is not in
 # ~/spp_data_pipeline.
 [Unit]
 Description=SPP data pipeline (Astro / Airflow in Docker)
 After=default.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=%h/spp_data_pipeline
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 150); do docker info >/dev/null 2>&1 && exit 0; sleep 2; done; echo "Docker is not ready" >&2; exit 1'
 ExecStart=/usr/bin/env astro dev start --no-browser
 ExecStop=/usr/bin/env astro dev stop
-TimeoutStartSec=900
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=1200
 
 [Install]
 WantedBy=default.target

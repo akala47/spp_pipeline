@@ -29,7 +29,7 @@ For the time rules, refer to README → [Time conventions](README.md#time-conven
 | DAG or process | Task | Schedule | What it does |
 |---|---|---|---|
 | `scada_beatrice` (VPS, Airflow) | `scrape` | Each minute | Starts headless Chrome, logs in to the Beatrice HMI and reads the MW value from the one-line diagram (old extract code). Writes one row to `mw_updates` with the spine id of the 5-minute interval of the reading. One retry after 10 s. No catchup: a run that occurs late would record the wrong time. |
-| `spp.scada.garden_city` (VPN device, launchd) | loop | About each minute | The same for the Garden City (Jameson) HMI, which is only available through the site VPN. Uses the loop of the old script: 60 s wait after a good reading, 5 s to 30 s wait after a failure, 5-minute pause after 5 failures in a row. Rejects values outside 0 to `GC_MW_CEIL`. |
+| `spp.scada.garden_city` (VPN device, launchd) | loop | About each minute | Reads three values from the Garden City load SVG page (`GC_SVG_LINK`): `GC_JAMESON`, `GC_LEWIS` and `GC_TOTAL`, with one read time. The HMI is only available through the site VPN. A value that cannot be read is logged and skipped; the others are still written. Uses the loop of the old script: 60 s wait after a good reading, 5 s to 30 s wait after a failure, 5-minute pause after 5 failures in a row. Rejects values outside 0 to `GC_MW_CEIL` (`GC_TOTAL_MW_CEIL` for the total). |
 
 ## Manual operations
 
@@ -46,7 +46,7 @@ These operations do not have a schedule. Run them in the Airflow container
 | `python -m spp.run --feed <f> --check-db` | Makes sure that the DSN is correct and shows the number of spine rows. |
 | `python -m spp.run --feed <f> --list-groups` | Shows the groups for the feed. |
 | `python -m spp.scada.beatrice [--dry-run] [--headed]` | One Beatrice reading. |
-| `python -m spp.scada.garden_city --once [--dry-run] [--headed]` | One Garden City reading (on the VPN device). |
+| `python -m spp.scada.garden_city --once [--dry-run] [--headed]` | One Garden City reading of the three values (on the VPN device). |
 | `python -m spp.scada.import_legacy dump.csv [--dry-run]` | Loads a CSV dump of the old `mw_updates` table into the new table. |
 | `make reset-dev` | DEV ONLY. Deletes all pipeline tables and makes them again (`00_reset_dev.sql`, `01_schema.sql`, `02_seed.sql`). |
 

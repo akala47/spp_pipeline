@@ -5,7 +5,7 @@ reading to `mw_updates`. The scraping (extract) code is a copy of the old
 scripts; only the transform and load (spp.scada.common) are new.
 
     timestamp_id       spine id of the 5-minute interval the reading falls in
-    location           'BEATRICE' | 'GARDEN_CITY'
+    location           'BEATRICE' | 'GC_JAMESON' | 'GC_LEWIS'
     reading_timestamp  Central wall-clock time the reading was taken
     mw_reading         MW, rounded half-up to 3 decimals
 

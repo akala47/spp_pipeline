@@ -115,9 +115,11 @@ astro version
 The installer puts `astro` in `/usr/local/bin`. You run all `astro` commands
 as `spp`, not with `sudo`.
 
-The Astro CLI starts its own Postgres container for the Airflow metadata. By
-default this container uses port 5432. The warehouse Postgres on the VPS also
-uses 5432. Move the Astro port:
+The Astro CLI starts its own Postgres container for the Airflow metadata.
+Recent versions of the Astro CLI give each project its own ports (for
+example 14329 for this database), so there is no conflict with the warehouse
+Postgres on 5432. An older version uses 5432. If `astro dev start` stops with
+"port 5432 is in use", move the Astro port:
 
 ```bash
 astro config set -g postgres.port 5435
@@ -202,7 +204,7 @@ sudo ufw status verbose
 ```
 
 > **WARNING:** ports that Docker publishes do not go through `ufw`. The Astro
-> stack publishes the Airflow UI (8080) and its metadata database (5435) on
+> stack publishes the Airflow UI and its metadata database on
 > all interfaces. The local Airflow UI of the Astro CLI does not ask for a
 > login. Thus you must also set the **firewall of the VPS provider** (cloud
 > firewall or security group) to allow only:
@@ -210,7 +212,9 @@ sudo ufw status verbose
 > - TCP 22 from your addresses.
 > - TCP 5432 from the Garden City device.
 >
-> Do not open 8080 or 5435. Use an SSH tunnel for the UI (step 9).
+> Do not open the Astro ports (for example 6563, 8080, 5435, or the ports in
+> `astro dev ps`). Use an SSH tunnel for the UI (step 9). To see which ports
+> listen on all interfaces, run `sudo ss -tlnp`.
 
 ## 7. Get the code and set the configuration
 
@@ -377,13 +381,56 @@ exit
 
 ### Open the Airflow UI
 
-Use an SSH tunnel from your computer:
+The ports depend on the Astro CLI version. Find them on the VPS:
 
 ```bash
-ssh -N -L 8080:localhost:8080 spp@<VPS_IP>
+cd ~/spp_data_pipeline && astro dev ps        # PORTS column of api-server
+journalctl --user -u spp-airflow.service -b --no-pager | grep 'Airflow UI'
 ```
 
-Then open `http://localhost:8080` on your computer.
+- **Recent Astro CLI:** the log shows
+  `Airflow UI: http://spp-data-pipeline.localhost:6563`. A local proxy
+  (`astro dev proxy`) listens on port 6563. The API server has its own port
+  (for example `13506` in `astro dev ps`).
+- **Older Astro CLI:** the log shows `http://localhost:8080`. The API server
+  listens on port 8080.
+
+Make sure that the UI answers on the VPS itself. Use the port of the API
+server:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<API_PORT>/
+# 200 or 302 = OK
+```
+
+Then open an SSH tunnel from your computer. Use one of these two methods.
+
+**Method A: tunnel to the API server (all browsers).** Your computer uses
+port 8080, and the VPS uses the API server port:
+
+```bash
+ssh -N -L 8080:127.0.0.1:<API_PORT> spp@<VPS_IP>      # for example <API_PORT> = 13506
+```
+
+Open `http://localhost:8080`.
+
+**Method B: tunnel to the Astro proxy.** Use the same port on both sides:
+
+```bash
+ssh -N -L 6563:127.0.0.1:6563 spp@<VPS_IP>
+```
+
+Open `http://spp-data-pipeline.localhost:6563`. The proxy selects the
+project from this name, so `http://localhost:6563` does not work. Chrome and
+Firefox send `*.localhost` to your computer. If your browser does not, use
+method A.
+
+Use `127.0.0.1`, not `localhost`, on the right side of `-L`: `localhost` can
+resolve to the IPv6 address `::1`, and the tunnel then fails.
+
+If the browser shows "connection reset", the tunnel works but nothing
+answers on that port of the VPS. Examine the port (above) and refer to
+"After a reboot" below.
 
 ### Set the node groups and unpause the DAGs
 
@@ -418,14 +465,57 @@ systemctl --user enable spp-airflow.service
 sudo loginctl enable-linger spp           # one time: start the unit without a login
 ```
 
-Make sure that it works:
+Make sure that linger is on. Without linger, the unit starts only when `spp`
+logs in, not when the VPS starts:
 
 ```bash
-sudo reboot
-# after the reboot, log in as spp:
-systemctl --user status spp-airflow.service
-astro dev ps
+loginctl show-user spp --property=Linger      # must show Linger=yes
 ```
+
+If you installed the unit before this version, copy it again and reload
+(`systemctl --user daemon-reload`). The current unit waits for Docker and
+tries again after a failure.
+
+### After a reboot
+
+The stack needs time to start. Docker starts first, then the unit runs
+`astro dev start`. The Airflow API server answers approximately 2 to 5
+minutes after the VPS starts. During this time, the tunnel shows
+"connection reset".
+
+1. Log in as `spp` and look at the unit:
+
+   ```bash
+   systemctl --user status spp-airflow.service
+   journalctl --user -u spp-airflow.service -b --no-pager | tail -n 40
+   ```
+
+   - `active (exited)`: the start is complete. Go to step 2.
+   - `activating (start)`: the start continues. Wait, then do this step again.
+   - `failed`: read the journal lines. Correct the cause, then run
+     `systemctl --user restart spp-airflow.service`.
+   - `Unit spp-airflow.service could not be found`: install the unit (above).
+
+2. Look at the containers:
+
+   ```bash
+   cd ~/spp_data_pipeline && astro dev ps
+   ```
+
+   All containers must show `Up`. If `api-server` shows `Restarting` or
+   `Exited`, look at its log: `docker logs --tail 50 $(docker ps -aqf name=api-server)`.
+   A frequent cause is too little memory (refer to README → VPS
+   configuration).
+
+3. Make sure that the API server answers on the VPS itself:
+
+   ```bash
+   curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<API_PORT>/
+   # <API_PORT> from `astro dev ps`, or 8080 on an older Astro CLI.
+   # 200 or 302 = OK. "Connection refused" or "reset" = not ready or wrong port.
+   ```
+
+   When this command shows 200 or 302, the tunnel also works.
 
 ## 10. Make a virtual environment for manual commands
 
@@ -602,10 +692,7 @@ documentation (`ssl_cert_file`, `ssl_key_file`).
 
    ```
    SPP_DSN=postgresql://spp:<password>@<VPS_IP>:5432/spp?sslmode=require
-   GC_HOME_LINK=...
-   GC_SVG_XPATH=...
-   GC_USER=...          # only if the HMI shows a login form
-   GC_PWD=...
+   GC_SVG_LINK=...      # the Garden City load SVG page
    ```
 
    Remove `SCADA_CHROME_BINARY` and `SCADA_CHROMEDRIVER` if Chrome is in the
@@ -707,4 +794,5 @@ pg_restore -h localhost -U spp -d spp --clean --if-exists ~/backups/spp_<date>.d
 | `SPP_DSN` is empty after `. ./.env` | The value contains `&` and has no quotes | Put the value in single quotes |
 | Disk is almost full | Airflow task logs, Docker images, backups | Step 13: clean the logs; `docker system prune`; move old backups |
 | `git clone` or `git pull`: `Permission denied (publickey)` | The deploy key is not on GitHub, or the remote does not use `github-spp` | Do step 7.2 again. `git remote -v` must show `git@github-spp:akala47/spp_pipeline.git`. |
+| Tunnel to the UI: "connection reset" | The tunnel goes to a port where nothing listens (the Astro CLI does not use 8080), or the API server is not running yet | Step 9, "Open the Airflow UI": find the API server port with `astro dev ps` and tunnel to it |
 | `git clone` checks out the wrong branch | The default branch on GitHub is not `main` | Clone with `-b main`, or run `git checkout main` |

@@ -1,5 +1,8 @@
 """Shared TRANSFORM and LOAD for the SCADA scrapers. No scraping here.
 
+garden_city.py does not use this module: it is a standalone script with its
+own copy of these functions (tests/test_scada.py checks that they agree).
+
 The EXTRACT part (Chrome options, login, page navigation, element ids,
 waits) is in each scraper module and is a copy of the old scripts
 (beatrice_mw.py, garden_city.py). This module holds what is new:
@@ -48,6 +51,10 @@ class ReadingUnavailable(ValueError):
 
 class ReadingRejected(ValueError):
     """A value was read but failed the sanity check."""
+
+
+class UnknownLocation(LookupError):
+    """The reading's location code is not in scada_locations."""
 
 
 @dataclass(frozen=True)
@@ -175,9 +182,15 @@ def ensure_spine(conn, intervals) -> None:
 
 
 def write_readings(readings: list[Reading], *, dsn: str | None = None) -> int:
-    """Insert readings; a re-sent reading is ignored. Returns rows inserted."""
+    """Insert readings; a re-sent reading is ignored. Returns rows inserted.
+
+    Raises UnknownLocation when a location code is not in scada_locations.
+    """
     if not readings:
         return 0
+    import psycopg2
+
+
     with db.connect(dsn) as conn:
         ensure_spine(conn, [r.interval_central for r in readings])
         db.ensure_partitions(conn, TABLE, [r.interval_central for r in readings])
@@ -189,6 +202,14 @@ def write_readings(readings: list[Reading], *, dsn: str | None = None) -> int:
                                              r.reading_timestamp, r.mw_reading))
                     inserted += cur.rowcount
             conn.commit()
+        except psycopg2.errors.ForeignKeyViolation as exc:
+            conn.rollback()
+            if "scada_locations" not in str(exc):
+                raise
+            codes = sorted({r.location for r in readings})
+            raise UnknownLocation(
+                f"location {', '.join(codes)} is not in scada_locations; "
+                "add it there before this scraper can write") from exc
         except Exception:
             conn.rollback()
             raise
@@ -197,10 +218,19 @@ def write_readings(readings: list[Reading], *, dsn: str | None = None) -> int:
 
 def record(reading: Reading, *, dsn: str | None = None) -> int:
     """Write one reading and log it."""
-    inserted = write_readings([reading], dsn=dsn)
-    log.info(f"{reading.location} {reading.mw_reading} MW",
-             extra={"event": "scada.reading", "location": reading.location,
-                    "timestamp_id": reading.timestamp_id,
-                    "reading_timestamp": reading.reading_timestamp.isoformat(),
-                    "mw": str(reading.mw_reading), "inserted": inserted})
+    return record_all([reading], dsn=dsn)
+
+
+def record_all(readings: list[Reading], *, dsn: str | None = None) -> int:
+    """Write readings in one transaction and log each one."""
+    inserted = write_readings(readings, dsn=dsn)
+    for reading in readings:
+        log.info(f"{reading.location} {reading.mw_reading} MW",
+                 extra={"event": "scada.reading", "location": reading.location,
+                        "timestamp_id": reading.timestamp_id,
+                        "reading_timestamp": reading.reading_timestamp.isoformat(),
+                        "mw": str(reading.mw_reading)})
+    log.info(f"{inserted} of {len(readings)} readings inserted",
+             extra={"event": "scada.write", "inserted": inserted,
+                    "readings": len(readings)})
     return inserted

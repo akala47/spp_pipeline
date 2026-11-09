@@ -14,7 +14,8 @@
 BEGIN;
 
 DROP TABLE IF EXISTS rt_lmp, rt_mcp, da_lmp, da_mcp, hourly_load,
-                     mw_updates, mw_updates_legacy, timestamps CASCADE;
+                     mw_updates, mw_updates_legacy, scada_locations,
+                     timestamps CASCADE;
 
 DROP FUNCTION IF EXISTS seed_partitions(date, date);
 DROP FUNCTION IF EXISTS seed_timestamps(timestamp, timestamp);

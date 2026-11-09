@@ -195,18 +195,44 @@ CREATE TABLE hourly_load (
     UNIQUE (timestamp_id)
 );
 
--- MW UPDATES — SCADA site-load readings (Beatrice, Garden City), about one
--- per site per minute. Written by spp/scada (not the SPP feed loader).
+-- SCADA LOCATIONS — the meters that write to mw_updates. mw_updates.location
+-- must be one of these codes, so a mistyped code in a scraper fails on its
+-- first write instead of starting a new series. To add a meter, insert a row
+-- here (and in schema/patches for a database that exists).
+--   location   code written by the scraper (upper case, A-Z 0-9 _)
+--   site       the city / substation that the meter is in
+--   meter      the meter within the site; NULL when the site has only one
+-- The old single-site scraper wrote Jameson readings as 'GARDEN_CITY'. Those
+-- rows are GC_JAMESON here: spp.scada.import_legacy and the 2026-11-06 patch
+-- rename them.
+CREATE TABLE scada_locations (
+    location    text PRIMARY KEY CHECK (location ~ '^[A-Z][A-Z0-9_]*$'),
+    site        text NOT NULL,
+    meter       text,
+    description text
+);
+
+INSERT INTO scada_locations (location, site, meter, description) VALUES
+    ('BEATRICE',   'Beatrice',    NULL,      'Beatrice city load'),
+    ('GC_JAMESON', 'Garden City', 'Jameson', 'Garden City, Jameson meter (old code GARDEN_CITY)'),
+    ('GC_LEWIS',   'Garden City', 'Lewis',   'Garden City, Lewis meter'),
+    ('GC_TOTAL',   'Garden City', 'Total',   'Garden City total load, as the HMI shows it');
+
+-- MW UPDATES — SCADA site-load readings (Beatrice, Garden City Jameson and
+-- Lewis), about one per meter per minute. Written by spp/scada (not the SPP
+-- feed loader).
 --   timestamp_id       spine id of the 5-minute interval the reading falls in,
 --                      so ~5 readings share an id; enforced by the CHECK below
---   location           'BEATRICE' | 'GARDEN_CITY'
+--   location           a scada_locations code: 'BEATRICE' | 'GC_JAMESON' |
+--                      'GC_LEWIS' | 'GC_TOTAL'
 --   reading_timestamp  Central wall-clock time the reading was taken
 --   mw_reading         MW, 3 decimals
 -- Partitioned monthly on timestamp_id like rt_lmp; the primary key makes a
 -- re-sent reading a no-op.
 CREATE TABLE mw_updates (
     timestamp_id      text COLLATE "C" NOT NULL REFERENCES timestamps (id) ON DELETE RESTRICT,
-    location          text          NOT NULL,
+    location          text          NOT NULL REFERENCES scada_locations (location)
+                                             ON UPDATE CASCADE ON DELETE RESTRICT,
     reading_timestamp timestamp     NOT NULL,
     mw_reading        numeric(10,3) NOT NULL,
     PRIMARY KEY (timestamp_id, location, reading_timestamp),

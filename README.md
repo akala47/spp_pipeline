@@ -40,6 +40,7 @@ spp/scada/      SCADA scrapers: beatrice, garden_city, common (transform and
 schema/         01_schema.sql   tables, functions, indexes
                 02_seed.sql     spine rows and monthly partitions
                 00_reset_dev.sql  DEV ONLY: delete all pipeline tables
+                patches/        one-off changes for databases that exist
 config/         groups.json: named node and zone groups
 dags/           Airflow DAGs: spp_realtime.py, spp_daily.py, scada.py
 scripts/        backfill.sh: load a calendar range, one month at a time
@@ -166,7 +167,9 @@ make reset-dev SPP_DSN="$SPP_DSN" SEED_FROM=2026-01-01 SEED_TO=2026-12-31
 astro dev start
 ```
 
-The Airflow UI is at `localhost:8080`. To make sure that the package and the
+The `astro dev start` output shows the URL of the Airflow UI (for example
+`http://spp-data-pipeline.localhost:6563`, or `localhost:8080` on an older
+Astro CLI). To make sure that the package and the
 DSN are correct, run these commands in the container:
 
 ```bash
@@ -448,18 +451,43 @@ the bounds from a date picker to the 5-minute grid, or use `…HB00MB00` and
 | Column | Meaning |
 |---|---|
 | `timestamp_id` | Spine id of the 5-minute interval that contains the reading. A reading at 10:47:11 is `…HB10MB45`. |
-| `location` | `BEATRICE` or `GARDEN_CITY` |
+| `location` | A code from `scada_locations` (below) |
 | `reading_timestamp` | Central wall-clock time of the reading |
 | `mw_reading` | MW, rounded half-up to 3 decimals |
 
 The primary key `(timestamp_id, location, reading_timestamp)` makes a reading
 that is sent again a no-op.
 
+`scada_locations` lists the meters. `mw_updates.location` has a foreign key to
+it, so a scraper with a wrong code fails on its first write
+(`UnknownLocation`) and does not start a new series.
+
+| `location` | Site | Meter |
+|---|---|---|
+| `BEATRICE` | Beatrice | |
+| `GC_JAMESON` | Garden City | Jameson. The old single-site scraper wrote these readings as `GARDEN_CITY`; `import_legacy` and the patch rename them. |
+| `GC_LEWIS` | Garden City | Lewis |
+| `GC_TOTAL` | Garden City | Total load, as the HMI shows it |
+
+To add a meter, add a row in `01_schema.sql` and a patch in `schema/patches/`
+for the databases that exist. A database built before 2026-11-06 needs
+`schema/patches/2026-11-06_scada_locations.sql` and then
+`schema/patches/2026-11-08_gc_total.sql` (both safe to run again).
+
 **Extract, transform, load.** The extract (scrape) code in
-`spp/scada/beatrice.py` and `spp/scada/garden_city.py` is a copy of the old
-scripts (`beatrice_mw.py`, `garden_city.py`). It uses the same Chrome options,
-login, pages, element ids and waits. Do not change it. Only the transform and
-the load are new. They are in `spp/scada/common.py`:
+`spp/scada/beatrice.py` is a copy of the old `beatrice_mw.py`: the same
+Chrome options, login, pages, element ids and waits. Do not change it.
+`spp/scada/garden_city.py` keeps the Chrome options and loop of the old
+`garden_city.py`, but opens the load SVG page (`GC_SVG_LINK`) directly (the
+HMI no longer asks for a login) and reads
+Jameson, Lewis and the total from the XPaths in `XPATHS`. These are Chrome
+"Copy full XPath" paths; `svg_xpath()` rewrites the SVG steps
+(`*[local-name()='text']`) because a plain `svg/g/text` step does not match
+SVG elements in an HTML page. `garden_city.py` is a standalone script: it
+imports nothing from this repository and carries its own copy of the
+transform and the load below (`tests/test_scada.py` checks that the copy
+gives the same spine ids and values). Beatrice uses
+`spp/scada/common.py`:
 
 - **Transform.** `parse_mw_text()` reads the number, rounds it half-up to 3
   decimals and checks the range (0 to `BEATRICE_MW_CEIL` or `GC_MW_CEIL`).
@@ -486,7 +514,7 @@ python -m spp.scada.beatrice --headed    # show the browser (development)
 
 Each scraper stops before Chrome starts if a setting is missing. Beatrice
 needs `BEATRICE_USER`, `BEATRICE_PWD`, `BEATRICE_LOGIN_URL` and
-`BEATRICE_SVG_URL`. Garden City needs `GC_HOME_LINK` and `GC_SVG_XPATH`. Both
+`BEATRICE_SVG_URL`. Garden City needs `GC_SVG_LINK`. Both
 need `SPP_DSN`, except with `--dry-run`.
 
 **Garden City** runs on the device that has the site VPN, as a standalone
@@ -504,6 +532,14 @@ to `DEPLOY_VPS.md`, step 12).
 python3 -m venv .venv && .venv/bin/pip install -e '.[scada]'
 .venv/bin/python -m spp.scada.garden_city --once --dry-run   # test
 .venv/bin/python -m spp.scada.garden_city                    # loop
+```
+
+Without the repository, copy only `spp/scada/garden_city.py` and a `.env`
+(with `GC_SVG_LINK` and `SPP_DSN`) into one folder:
+
+```bash
+pip install selenium psycopg2-binary python-dotenv
+python garden_city.py --once --dry-run
 ```
 
 To keep the loop running on a Mac, install the launchd unit:
@@ -546,9 +582,11 @@ If you run it again, it skips the readings that are already in the table. Add
 | `SCADA_LOG_FILE` | — | Garden City: also write the log to this rotating file |
 | `BEATRICE_USER`, `BEATRICE_PWD`, `BEATRICE_LOGIN_URL`, `BEATRICE_SVG_URL` | — | Beatrice HMI login and diagram page |
 | `BEATRICE_MW_CEIL` | — | Optional upper limit for a Beatrice value |
-| `GC_HOME_LINK`, `GC_SVG_XPATH` | — | Garden City HMI home page and the link to the diagram |
-| `GC_USER`, `GC_PWD` | — | Only if the Garden City HMI shows a login form |
-| `GC_MW_CEIL` | `10` | Upper limit for a Garden City value |
+| `GC_SVG_LINK` | — | Garden City load SVG page (no login) |
+| `GC_MW_CEIL` | `10` | Upper limit for the Jameson and Lewis values |
+| `GC_TOTAL_MW_CEIL` | `20` | Upper limit for the Garden City total |
+| `GC_TOTAL_TOLERANCE` | `0.1` | MW. Log `scada.total_mismatch` when the total differs from Jameson + Lewis by more |
+| `GC_PAGE_WAIT` | `15` | Seconds to wait for the values on the load SVG page |
 
 After you change `.env`, run `astro dev restart`. Airflow reads changes to
 files in `dags/` in approximately 30 seconds.
