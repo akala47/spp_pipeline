@@ -52,7 +52,7 @@ Environment (or a .env file in the working directory or above):
     GC_MW_CEIL           upper limit for Jameson and Lewis, MW   (default 10)
     GC_TOTAL_MW_CEIL     upper limit for the total, MW           (default 20)
     GC_TOTAL_TOLERANCE   warn when total != Jameson + Lewis by more, MW (0.1)
-    GC_PAGE_WAIT         seconds to wait for the values          (default 15)
+    GC_PAGE_WAIT         seconds to wait for all three values    (default 30)
     GC_MW_LOG            reading log file      (default logs/current_mw_log.txt)
     SCADA_LOG_FILE       also write the log to this rotating file
     SCADA_LOG_LEVEL      DEBUG, INFO, ...                        (default INFO)
@@ -75,10 +75,10 @@ from zoneinfo import ZoneInfo
 import psycopg2
 from selenium import webdriver
 from selenium.common.exceptions import (NoSuchElementException,
+                                        StaleElementReferenceException,
                                         TimeoutException, WebDriverException)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 logger = logging.getLogger("gc_scraper")
@@ -298,6 +298,15 @@ def _element_text(elem) -> str:
     return text
 
 
+def _all_values_shown(driver) -> bool:
+    """True once every XPATHS label shows a number."""
+    for xpath in XPATHS.values():
+        text = _element_text(driver.find_element(By.XPATH, svg_xpath(xpath)))
+        if not _NUMBER.search(text.replace(",", "")):
+            return False
+    return True
+
+
 def scrape_raw(driver) -> dict[str, str | Exception]:
     """Open the load SVG page and return {location: display text}.
 
@@ -306,14 +315,18 @@ def scrape_raw(driver) -> dict[str, str | Exception]:
     """
     driver.get(os.getenv('GC_SVG_LINK'))
 
-    # Wait until the SVG has drawn its values (the old script slept 3 s).
-    wait = _env_float("GC_PAGE_WAIT", 15)
-    first = svg_xpath(next(iter(XPATHS.values())))
+    # Wait until every value shows a number. The SVG labels exist as soon as
+    # the page renders, but they hold a placeholder ('###.#' or blank) until
+    # the HMI pushes the live values, so waiting for the elements alone reads
+    # the placeholder ("no MW value in display text").
+    wait = _env_float("GC_PAGE_WAIT", 30)
     try:
-        WebDriverWait(driver, wait).until(
-            EC.presence_of_element_located((By.XPATH, first)))
+        WebDriverWait(driver, wait, poll_frequency=0.5,
+                      ignored_exceptions=(NoSuchElementException,
+                                          StaleElementReferenceException)
+                      ).until(_all_values_shown)
     except TimeoutException:
-        logger.warning(f"values not on the page after {wait:g} s; trying each one")
+        logger.warning(f"values not all shown after {wait:g} s; reading what is there")
 
     out: dict[str, str | Exception] = {}
     for location, xpath in XPATHS.items():

@@ -216,15 +216,16 @@ INSERT INTO scada_locations (location, site, meter, description) VALUES
     ('BEATRICE',   'Beatrice',    NULL,      'Beatrice city load'),
     ('GC_JAMESON', 'Garden City', 'Jameson', 'Garden City, Jameson meter (old code GARDEN_CITY)'),
     ('GC_LEWIS',   'Garden City', 'Lewis',   'Garden City, Lewis meter'),
-    ('GC_TOTAL',   'Garden City', 'Total',   'Garden City total load, as the HMI shows it');
+    ('GC_TOTAL',   'Garden City', 'Total',   'Garden City total load, as the HMI shows it'),
+    ('SHERBURNE_CITY', 'Sherburne', NULL,  'Sherburne city load (Demand now)');
 
--- MW UPDATES — SCADA site-load readings (Beatrice, Garden City Jameson and
--- Lewis), about one per meter per minute. Written by spp/scada (not the SPP
+-- MW UPDATES — SCADA site-load readings (Beatrice, Garden City Jameson,
+-- Lewis and total, Sherburne), about one per meter per minute. Written by spp/scada (not the SPP
 -- feed loader).
 --   timestamp_id       spine id of the 5-minute interval the reading falls in,
 --                      so ~5 readings share an id; enforced by the CHECK below
 --   location           a scada_locations code: 'BEATRICE' | 'GC_JAMESON' |
---                      'GC_LEWIS' | 'GC_TOTAL'
+--                      'GC_LEWIS' | 'GC_TOTAL' | 'SHERBURNE_CITY'
 --   reading_timestamp  Central wall-clock time the reading was taken
 --   mw_reading         MW, 3 decimals
 -- Partitioned monthly on timestamp_id like rt_lmp; the primary key makes a

@@ -99,11 +99,12 @@ def test_scraper_codes_are_in_the_schema():
     import re
     from pathlib import Path
 
-    from spp.scada import beatrice, garden_city
+    from spp.scada import beatrice, garden_city, sherburne_city
 
     root = Path(__file__).resolve().parent.parent / "schema"
-    want = {beatrice.LOCATION, *garden_city.XPATHS}
-    assert want == {"BEATRICE", "GC_JAMESON", "GC_LEWIS", "GC_TOTAL"}
+    want = {beatrice.LOCATION, *garden_city.XPATHS, sherburne_city.LOCATION}
+    assert want == {"BEATRICE", "GC_JAMESON", "GC_LEWIS", "GC_TOTAL",
+                    "SHERBURNE_CITY"}
 
     def seeded(*files):
         text = "".join((root / f).read_text() for f in files)
@@ -111,7 +112,8 @@ def test_scraper_codes_are_in_the_schema():
 
     assert want <= seeded("01_schema.sql")
     assert want <= seeded("patches/2026-11-06_scada_locations.sql",
-                          "patches/2026-11-08_gc_total.sql")
+                          "patches/2026-11-08_gc_total.sql",
+                          "patches/2026-11-11_sherburne_city.sql")
 
 
 # --------------------------------------------------------------------------- #
@@ -226,6 +228,38 @@ def test_single_run_reads_three_values_from_the_svg_link(monkeypatch, capsys):
     assert values == {"GC_LEWIS": Decimal("3.200"), "GC_JAMESON": Decimal("4.100"),
                       "GC_TOTAL": Decimal("7.300")}
     assert "not written" in capsys.readouterr().out
+
+
+class _LoadingElem:
+    """Shows the HMI placeholder for the first few reads, then the value."""
+
+    def __init__(self, value, placeholder_reads):
+        self.value, self.left = value, placeholder_reads
+
+    @property
+    def text(self):
+        if self.left > 0:
+            self.left -= 1
+            return "###.#"
+        return self.value
+
+    def get_attribute(self, name):
+        return self.text
+
+
+def test_single_run_waits_for_values_not_placeholders(monkeypatch):
+    from spp.scada import garden_city
+
+    monkeypatch.setenv("GC_SVG_LINK", "https://hmi/load.svg")
+    monkeypatch.setenv("GC_PAGE_WAIT", "5")
+    driver = _FakeDriver({})
+    elems = {garden_city.svg_xpath(garden_city.XPATHS[k]): _LoadingElem(v, 3)
+             for k, v in {"GC_JAMESON": "8.136", "GC_LEWIS": "1.104",
+                          "GC_TOTAL": "9.244"}.items()}
+    driver.find_element = lambda by, value: elems[value]
+    values, _ = garden_city.scrape_mw_single_run(driver, dry_run=True)
+    assert values == {"GC_JAMESON": Decimal("8.136"), "GC_LEWIS": Decimal("1.104"),
+                      "GC_TOTAL": Decimal("9.244")}
 
 
 def test_single_run_fails_only_when_nothing_was_read(monkeypatch):
@@ -401,12 +435,12 @@ def test_garden_city_writes_its_own_rows(conn):
 
 @db_only
 def test_scraper_codes_are_registered(conn):
-    from spp.scada import beatrice, garden_city
+    from spp.scada import beatrice, garden_city, sherburne_city
 
     with conn.cursor() as cur:
         cur.execute("SELECT location FROM scada_locations")
         codes = {r[0] for r in cur.fetchall()}
-    assert {beatrice.LOCATION, *garden_city.XPATHS} <= codes
+    assert {beatrice.LOCATION, *garden_city.XPATHS, sherburne_city.LOCATION} <= codes
 
 
 @db_only
@@ -448,3 +482,216 @@ def test_import_legacy_csv(conn, tmp_path):
     stats = import_csv(str(dump))
     assert stats["inserted"] == 2 and stats["bad"] == 1
     assert import_csv(str(dump))["inserted"] == 0    # re-run is a no-op
+
+
+# --------------------------------------------------------------------------- #
+# Sherburne city: standalone, one login per 15 readings (no browser)
+# --------------------------------------------------------------------------- #
+def test_sherburne_units():
+    from spp.scada.sherburne_city import (ReadingRejected, ReadingUnavailable,
+                                          parse_demand, unit_of)
+
+    assert unit_of("12,345 kW") == "kW"
+    assert unit_of("12.3 MW") == "MW"
+    assert unit_of("12.3", "kW") == "kW"
+    assert unit_of("12.3") == "MW"
+    assert parse_demand("12,345.6", "kW", ceiling=100) == Decimal("12.346")
+    assert parse_demand("12.3456", "MW", ceiling=100) == Decimal("12.346")
+    with pytest.raises(ReadingRejected):        # kW read as MW
+        parse_demand("12345", "MW", ceiling=100)
+    with pytest.raises(ReadingUnavailable):
+        parse_demand("--", "kW", ceiling=100)
+
+
+def test_sherburne_copy_matches_the_pipeline():
+    from spp import db, spine
+    from spp.scada import common, sherburne_city as sc
+
+    t = datetime(2019, 1, 1)
+    while t < datetime(2028, 1, 1):
+        ts = t.replace(minute=47, second=11)
+        assert sc.spine_id(sc.interval_begin(ts)) == spine.spine_id_for(ts)
+        assert sc.central_to_utc(sc.interval_begin(ts)) == db._central_to_utc(
+            spine.interval_begin(ts))
+        t += timedelta(hours=7, minutes=13)
+    for text in ("33.372", "38.302937 MW", "1,234.5", "0"):
+        assert sc.parse_mw_text(text) == common.parse_mw_text(text)
+    assert " ".join(sc.INSERT_SQL.split()) == " ".join(common.INSERT_SQL.split())
+
+
+def test_sherburne_runs_outside_the_repository(tmp_path):
+    import shutil
+    import subprocess
+    import sys
+
+    from spp.scada import sherburne_city
+
+    script = tmp_path / "sherburne_city.py"
+    shutil.copy(sherburne_city.__file__, script)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("SC_", "SPP_", "PYTHONPATH"))}
+    proc = subprocess.run([sys.executable, "-I", str(script), "--once", "--dry-run"],
+                          cwd=tmp_path, env=env, capture_output=True, text=True,
+                          timeout=60)
+    assert proc.returncode == 2, proc.stderr
+    assert "missing settings: SC_LOGIN_LINK, SC_USER, SC_PWD" in proc.stderr
+
+
+class _ScElem:
+    def __init__(self, page, name):
+        self.page, self.name = page, name
+
+    @property
+    def text(self):
+        return self.page.text_of(self.name)
+
+    def get_attribute(self, name):
+        return self.text
+
+    def clear(self):
+        self.page.typed[self.name] = ""
+
+    def send_keys(self, keys):
+        self.page.typed[self.name] = self.page.typed.get(self.name, "") + keys
+        if self.name == "password" and keys == "\ue006":       # Keys.RETURN
+            self.page.logged_in = True
+
+    def click(self):
+        if self.name == "graphs":
+            self.page.handles.append("graphs-tab")      # opens a new tab
+
+
+class _ScSwitch:
+    def __init__(self, page):
+        self.page = page
+
+    def window(self, handle):
+        self.page.current_window_handle = handle
+
+
+class _ScDriver:
+    """Login page -> home page -> real time graphs in a new tab."""
+
+    def __init__(self, values, placeholder_reads=2):
+        from spp.scada.sherburne_city import DEMAND_BOX, XPATHS
+
+        self.by_xpath = {v: k for k, v in XPATHS.items()}
+        self.by_xpath[DEMAND_BOX] = "box"
+        self.values = list(values)
+        self.placeholder = placeholder_reads
+        self.typed, self.logged_in, self.visited = {}, False, []
+        self.handles = ["main"]
+        self.current_window_handle = "main"
+        self.switch_to = _ScSwitch(self)
+        self.quit_called = False
+
+    window_handles = property(lambda self: list(self.handles))
+
+    def get(self, url):
+        self.visited.append(url)
+
+    def quit(self):
+        self.quit_called = True
+
+    def text_of(self, name):
+        if name == "demand":
+            if self.placeholder:
+                self.placeholder -= 1
+                return ""
+            return self.values.pop(0) if len(self.values) > 1 else self.values[0]
+        if name == "box":
+            return "kW"
+        return ""
+
+    def find_element(self, by, value):
+        from selenium.common.exceptions import NoSuchElementException
+
+        name = self.by_xpath.get(value)
+        visible = {"email", "password"} if not self.logged_in else {"graphs"}
+        if self.current_window_handle == "graphs-tab":
+            visible = {"demand", "box"}
+        if name not in visible:
+            raise NoSuchElementException(value)
+        return _ScElem(self, name)
+
+
+def _sc_env(monkeypatch):
+    from spp.scada import sherburne_city
+
+    monkeypatch.setenv("SC_LOGIN_LINK", "https://portal/login")
+    monkeypatch.setenv("SC_USER", "ops@example.com")
+    monkeypatch.setenv("SC_PWD", "pw")
+    monkeypatch.setenv("SC_PAGE_WAIT", "5")
+    monkeypatch.delenv("SC_VALUE_UNIT", raising=False)
+    monkeypatch.setattr(sherburne_city.time, "sleep", lambda s: None)
+    return sherburne_city
+
+
+def test_sherburne_cycle_logs_in_once_and_reads_each_minute(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    driver = _ScDriver(["21,500", "21,640", "21,700"])
+    monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
+    writer = sc.Writer(dry_run=True)
+    got = []
+    monkeypatch.setattr(writer, "add", got.append)
+    assert sc.run_cycle(writer, reads=3) == 3
+    assert driver.visited == ["https://portal/login"]          # one login
+    assert driver.typed == {"email": "ops@example.com", "password": "pw\ue006"}
+    assert driver.current_window_handle == "graphs-tab"
+    assert [r.mw_reading for r in got] == [Decimal("21.500"), Decimal("21.640"),
+                                            Decimal("21.700")]   # kW -> MW
+    assert {r.location for r in got} == {"SHERBURNE_CITY"}
+    assert driver.quit_called
+
+
+def test_sherburne_bad_login_is_reported(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    monkeypatch.setenv("SC_PAGE_WAIT", "0")
+    driver = _ScDriver(["1"])
+    driver.find_element_orig = driver.find_element
+
+    def never_logs_in(by, value):
+        driver.logged_in = False
+        return driver.find_element_orig(by, value)
+
+    driver.find_element = never_logs_in
+    monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
+    with pytest.raises(sc.LoginFailed):
+        sc.run_cycle(sc.Writer(dry_run=True), reads=2)
+    assert driver.quit_called
+
+
+def test_sherburne_three_bad_reads_end_the_cycle(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    monkeypatch.setenv("SC_PAGE_WAIT", "0")
+    driver = _ScDriver(["999999999"], placeholder_reads=0)     # above the ceiling
+    monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
+    reads = []
+    monkeypatch.setattr(sc, "read_once",
+                        lambda d: reads.append(1) or (_ for _ in ()).throw(
+                            sc.ReadingRejected("too big")))
+    with pytest.raises(sc.ReadingUnavailable):
+        sc.run_cycle(sc.Writer(dry_run=True), reads=15)
+    assert len(reads) == sc.MAX_READ_FAILURES
+
+
+def test_sherburne_writer_keeps_readings_when_the_database_is_down(monkeypatch, tmp_path):
+    sc = _sc_env(monkeypatch)
+    monkeypatch.setenv("SC_MW_LOG", str(tmp_path / "mw.log"))
+    calls = []
+
+    def write(readings):
+        calls.append(list(readings))
+        if len(calls) == 1:
+            raise OSError("timed out")
+        return len(readings)
+
+    monkeypatch.setattr(sc, "write_readings", write)
+    w = sc.Writer()
+    r1 = sc.Reading("SHERBURNE_CITY", datetime(2026, 11, 11, 10, 1), Decimal("20"))
+    r2 = sc.Reading("SHERBURNE_CITY", datetime(2026, 11, 11, 10, 2), Decimal("21"))
+    w.add(r1)
+    assert w.pending == [r1]
+    w.add(r2)
+    assert calls[-1] == [r1, r2] and w.pending == []
+    assert len((tmp_path / "mw.log").read_text().splitlines()) == 2

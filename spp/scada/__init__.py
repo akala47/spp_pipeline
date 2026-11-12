@@ -5,7 +5,8 @@ reading to `mw_updates`. The scraping (extract) code is a copy of the old
 scripts; only the transform and load (spp.scada.common) are new.
 
     timestamp_id       spine id of the 5-minute interval the reading falls in
-    location           'BEATRICE' | 'GC_JAMESON' | 'GC_LEWIS'
+    location           'BEATRICE' | 'GC_JAMESON' | 'GC_LEWIS' | 'GC_TOTAL' |
+                       'SHERBURNE_CITY'
     reading_timestamp  Central wall-clock time the reading was taken
     mw_reading         MW, rounded half-up to 3 decimals
 
@@ -13,6 +14,8 @@ A reading taken every minute gives about 5 rows per timestamp_id.
 
     spp.scada.common       transform (parse, spine id) and load (mw_updates)
     spp.scada.beatrice     one scrape per run (Airflow DAG `scada_beatrice`)
+    spp.scada.garden_city  standalone script (VPN device)
+    spp.scada.sherburne_city  standalone script: one login, 15 readings
     spp.scada.garden_city  standalone loop on the VPN-connected device
     spp.scada.import_legacy  load a CSV dump of the old mw_updates table
 

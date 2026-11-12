@@ -468,11 +468,13 @@ it, so a scraper with a wrong code fails on its first write
 | `GC_JAMESON` | Garden City | Jameson. The old single-site scraper wrote these readings as `GARDEN_CITY`; `import_legacy` and the patch rename them. |
 | `GC_LEWIS` | Garden City | Lewis |
 | `GC_TOTAL` | Garden City | Total load, as the HMI shows it |
+| `SHERBURNE_CITY` | Sherburne | City load ("Demand now"), from the standalone `spp/scada/sherburne_city.py` |
 
 To add a meter, add a row in `01_schema.sql` and a patch in `schema/patches/`
 for the databases that exist. A database built before 2026-11-06 needs
 `schema/patches/2026-11-06_scada_locations.sql` and then
-`schema/patches/2026-11-08_gc_total.sql` (both safe to run again).
+`schema/patches/2026-11-08_gc_total.sql`, then
+`schema/patches/2026-11-11_sherburne_city.sql` (all safe to run again).
 
 **Extract, transform, load.** The extract (scrape) code in
 `spp/scada/beatrice.py` is a copy of the old `beatrice_mw.py`: the same
@@ -586,7 +588,7 @@ If you run it again, it skips the readings that are already in the table. Add
 | `GC_MW_CEIL` | `10` | Upper limit for the Jameson and Lewis values |
 | `GC_TOTAL_MW_CEIL` | `20` | Upper limit for the Garden City total |
 | `GC_TOTAL_TOLERANCE` | `0.1` | MW. Log `scada.total_mismatch` when the total differs from Jameson + Lewis by more |
-| `GC_PAGE_WAIT` | `15` | Seconds to wait for the values on the load SVG page |
+| `GC_PAGE_WAIT` | `30` | Seconds to wait for all three values on the load SVG page to show a number (they show a placeholder until the HMI sends live values) |
 
 After you change `.env`, run `astro dev restart`. Airflow reads changes to
 files in `dags/` in approximately 30 seconds.
