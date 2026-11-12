@@ -3,10 +3,12 @@
 # extra_hosts: on a Linux VPS, Docker does not define host.docker.internal.
 #   This line adds it, so the containers can reach the Postgres server on the
 #   host with SPP_DSN=postgresql://...@host.docker.internal:5432/spp.
-# shm_size: the Beatrice scraper starts Chromium inside the scheduler
-#   container (tasks run there with the LocalExecutor). The old Chrome
-#   options do not include --disable-dev-shm-usage, so give Chromium a
-#   larger /dev/shm than the Docker default of 64 MB.
+# shm_size: the Beatrice and Sherburne scrapers start Chromium inside the
+#   scheduler container (tasks run there with the LocalExecutor); the
+#   Sherburne one stays open for about 15 minutes, alongside Beatrice's
+#   once-a-minute browser. Their Chrome options do not include
+#   --disable-dev-shm-usage, so give Chromium a larger /dev/shm than the
+#   Docker default of 64 MB.
 services:
   scheduler:
     extra_hosts:

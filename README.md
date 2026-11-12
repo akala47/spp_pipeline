@@ -514,10 +514,27 @@ python -m spp.scada.beatrice --dry-run   # print the reading only
 python -m spp.scada.beatrice --headed    # show the browser (development)
 ```
 
+**Sherburne** also runs on the VPS, in Airflow: DAG `scada_sherburne`,
+every 15 minutes. Each run is one cycle of `spp/scada/sherburne_city.py`:
+log in, click "View real time graphs", read "Demand now" (kW, divided by
+1000) once a minute for 15 readings, writing each one as it is taken. If the
+site logs out during a run, or 3 readings in a row fail, the task logs in
+again (up to 3 times per run). The run stops reading at 14.5 minutes, so it
+ends before the next one; it has no retries. The same file runs standalone
+on a device as the standby (`python sherburne_city.py`, flags `--once`,
+`--cycle`, `--reads N`, `--headed`, `--dry-run`); keep only one of the two
+running, or every reading is stored twice.
+
+```bash
+python -m spp.scada.sherburne_city --once --dry-run   # log in, one reading, print
+python -m spp.scada.sherburne_city --cycle --reads 3  # three readings, written
+```
+
 Each scraper stops before Chrome starts if a setting is missing. Beatrice
 needs `BEATRICE_USER`, `BEATRICE_PWD`, `BEATRICE_LOGIN_URL` and
-`BEATRICE_SVG_URL`. Garden City needs `GC_SVG_LINK`. Both
-need `SPP_DSN`, except with `--dry-run`.
+`BEATRICE_SVG_URL`. Garden City needs `GC_SVG_LINK`. Sherburne needs
+`SC_LOGIN_LINK`, `SC_USER` and `SC_PWD`. All need `SPP_DSN`, except with
+`--dry-run`.
 
 **Garden City** runs on the device that has the site VPN, as a standalone
 loop. The loop is the same as in the old script:

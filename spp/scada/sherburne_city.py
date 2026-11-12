@@ -16,7 +16,17 @@ One CYCLE is one login and SC_READS readings (default 15), one a minute:
        SHERBURNE_CITY, in MW
 
 then Chrome closes and the next cycle logs in again, so a new login happens
-about every 15 minutes.
+about every 15 minutes. If the site logs the scraper out during a cycle (the
+login form comes back) or three readings in a row fail, it logs in again
+within the same cycle, up to MAX_RELOGINS times.
+
+Two ways to run it, both with the same cycle:
+
+  * on the VPS, from the Airflow DAG `scada_sherburne` (dags/scada.py): one
+    cycle per run, every 15 minutes, via run_scheduled_cycle(). The settings
+    come from the Airflow .env.
+  * standalone, on any computer (this file alone, see below). Keep one of
+    the two running, not both: both would store every reading twice.
 
     python sherburne_city.py              # loop: cycle after cycle
     python sherburne_city.py --once       # log in, one reading, exit
@@ -25,8 +35,7 @@ about every 15 minutes.
     python sherburne_city.py --dry-run    # scrape and print, no writes
     python sherburne_city.py --reads 3    # readings per cycle (overrides SC_READS)
 
-A reading that cannot be read is logged and skipped; three failed readings in
-a row end the cycle early and the next cycle logs in again. If the database
+A reading that cannot be read is logged and skipped. If the database
 cannot be reached, the readings are kept in memory and sent with the next
 write (the insert ignores a reading it already has).
 
@@ -58,6 +67,8 @@ Environment (or a .env file in the working directory or above):
     SCADA_LOG_FILE       also write the log to this rotating file
     SCADA_LOG_LEVEL      DEBUG, INFO, ...                        (default INFO)
     SCADA_CHROME_BINARY / SCADA_CHROMEDRIVER   optional Chrome / driver paths
+                         (set on the Airflow image; Chrome then also runs
+                         with --no-sandbox, as the Beatrice scraper does)
 """
 from __future__ import annotations
 
@@ -105,7 +116,9 @@ XPATHS = {
 _WAIT_IGNORES = (NoSuchElementException, StaleElementReferenceException,
                  ElementNotInteractableException, ElementClickInterceptedException)
 
-MAX_READ_FAILURES = 3
+MAX_READ_FAILURES = 3      # failed readings in a row before logging in again
+MAX_RELOGINS = 3           # logins after the first, within one cycle
+SCHEDULED_CYCLE_SECONDS = 14 * 60 + 30   # no reading after this, per Airflow run
 
 
 # --------------------------------------------------------------------------- #
@@ -228,6 +241,10 @@ class LoginFailed(RuntimeError):
     """The login did not reach the page with 'View real time graphs'."""
 
 
+class LoggedOut(RuntimeError):
+    """The site ended the session: the login form is back."""
+
+
 _NUMBER = re.compile(r"[-+]?\d*\.?\d+")
 
 
@@ -289,6 +306,11 @@ def chrome_kwargs(options) -> dict:
 
 def create_driver(headless: bool = True):
     chrome_options = _chrome_options(headless)
+    if (os.environ.get("SCADA_CHROME_BINARY") or "").strip():
+        # Chromium inside the Airflow container: no usable sandbox there
+        # (same options as the Beatrice scraper).
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-gpu')
     driver = webdriver.Chrome(options=chrome_options, **chrome_kwargs(chrome_options))
     driver.set_page_load_timeout(60)
     logger.info("WebDriver created successfully")
@@ -314,8 +336,30 @@ def _element_text(elem) -> str:
 
 
 def login(driver) -> None:
-    """Log in and wait for the page with 'View real time graphs'."""
+    """Log in and wait for the page with 'View real time graphs'.
+
+    If the login link opens the home page instead of the form (the session
+    is still valid), there is nothing to type.
+    """
     driver.get(os.environ["SC_LOGIN_LINK"])
+
+    def form_or_home(d):
+        for name in ("email", "graphs"):
+            try:
+                d.find_element(By.XPATH, XPATHS[name])
+                return name
+            except NoSuchElementException:
+                pass
+        return False
+
+    try:
+        shown = _wait(driver).until(form_or_home)
+    except TimeoutException:
+        raise LoginFailed(f"no login form on {os.environ['SC_LOGIN_LINK']} "
+                          f"after {page_wait():g} s") from None
+    if shown == "graphs":
+        logger.info("still logged in")
+        return
     email = _find(driver, "email")
     email.clear()
     email.send_keys(os.environ["SC_USER"])
@@ -375,6 +419,15 @@ def read_demand_text(driver) -> str:
         except NoSuchElementException:
             raise NoSuchElementException("'Demand now' is gone from the page") from None
     return value_text
+
+
+def logged_out(driver) -> bool:
+    """True when the page shows the login form, i.e. the session ended."""
+    try:
+        driver.find_element(By.XPATH, XPATHS["email"])
+        return True
+    except (NoSuchElementException, StaleElementReferenceException):
+        return False
 
 
 def read_once(driver) -> Reading:
@@ -498,47 +551,111 @@ def _sleep_until(deadline: float) -> None:
 
 
 def run_cycle(writer: Writer, *, headless: bool = True,
-              reads: int | None = None) -> int:
+              reads: int | None = None, max_seconds: float | None = None) -> int:
     """Log in, open the graphs page, take `reads` readings a minute apart.
 
-    Returns the number of good readings. Raises when the login or the page
-    fails, or when no reading could be taken.
+    Logs in again in the same browser when the site logs out (the login form
+    is back) or MAX_READ_FAILURES readings in a row fail, up to MAX_RELOGINS
+    times; the reading that found the problem is retried after the login.
+    With max_seconds, no reading is taken later than that many seconds after
+    the start (the Airflow run must end before the next one is due).
+
+    Returns the number of good readings. Raises when the first login or the
+    page fails, or when no reading could be taken.
     """
+    t0 = time.monotonic()
     reads = reads_per_cycle() if reads is None else reads
     interval = read_interval()
     driver = None
-    good, failures_in_a_row = 0, 0
+    good, failures_in_a_row, relogins = 0, 0, 0
+
+    def take(i: int) -> None:
+        if logged_out(driver):
+            raise LoggedOut("the site logged out (login form shown)")
+        writer.add(read_once(driver))
+
+    def log_in_again() -> bool:
+        nonlocal relogins
+        if relogins >= MAX_RELOGINS:
+            return False
+        relogins += 1
+        logger.warning(f"logging in again ({relogins} of {MAX_RELOGINS} this cycle)")
+        try:
+            login(driver)
+            open_real_time_graphs(driver)
+            return True
+        except (LoginFailed, WebDriverException) as exc:
+            logger.error(f"logging in again failed: {exc}")
+            return False
+
     try:
         driver = create_driver(headless)
         login(driver)
         open_real_time_graphs(driver)
         start = time.monotonic()
         for i in range(reads):
+            due = start + i * interval
+            if max_seconds is not None and due > t0 + max_seconds:
+                logger.info(f"stopping after {i} readings: next one is past "
+                            f"{max_seconds:g} s")
+                break
             if i:
-                _sleep_until(start + i * interval)
+                _sleep_until(due)
             try:
-                writer.add(read_once(driver))
+                take(i)
                 good += 1
                 failures_in_a_row = 0
+                continue
             except UnknownLocation:
                 raise
-            except (ValueError, WebDriverException) as exc:
+            except (ValueError, WebDriverException, LoggedOut) as exc:
                 failures_in_a_row += 1
                 logger.error(f"reading {i + 1} of {reads} failed: {exc}")
-                if failures_in_a_row >= MAX_READ_FAILURES:
-                    logger.error(f"{failures_in_a_row} failed readings in a row; "
-                                 "logging in again")
-                    break
+                if not (isinstance(exc, LoggedOut)
+                        or failures_in_a_row >= MAX_READ_FAILURES):
+                    continue
+            # Logged out, or too many failures: log in again and retry this one.
+            if not log_in_again():
+                logger.error("could not log in again; ending this cycle")
+                break
+            failures_in_a_row = 0
+            try:
+                take(i)
+                good += 1
+            except UnknownLocation:
+                raise
+            except (ValueError, WebDriverException, LoggedOut) as exc:
+                failures_in_a_row += 1
+                logger.error(f"reading {i + 1} of {reads} failed after logging in "
+                             f"again: {exc}")
     finally:
         if driver is not None:
             try:
                 driver.quit()
             except Exception as exc:
                 logger.warning(f"Error closing driver: {exc}")
-    logger.info(f"cycle done: {good} of {reads} readings")
+    logger.info(f"cycle done: {good} of {reads} readings, {relogins} extra login(s)")
     if not good:
         raise ReadingUnavailable(f"no reading in this cycle of {reads}")
     return good
+
+
+def run_scheduled_cycle(max_seconds: float = SCHEDULED_CYCLE_SECONDS) -> dict:
+    """One cycle for a scheduler: the Airflow DAG `scada_sherburne`.
+
+    Headless, writes each reading as it is taken, and ends before the next
+    15-minute run is due. Raises (the run turns red) when a setting is
+    missing, no reading was taken, or readings could not be written.
+    """
+    check_env(*REQUIRED, "SPP_DSN")
+    value_unit()
+    writer = Writer()
+    good = run_cycle(writer, headless=True, max_seconds=max_seconds)
+    writer.flush()
+    if writer.pending:
+        raise RuntimeError(f"{len(writer.pending)} of {good} reading(s) not "
+                           "written to the database")
+    return {"location": LOCATION, "readings": good}
 
 
 def scrape_continuous(*, headless: bool = True, dry_run: bool = False,

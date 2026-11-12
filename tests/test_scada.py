@@ -556,11 +556,11 @@ class _ScElem:
     def send_keys(self, keys):
         self.page.typed[self.name] = self.page.typed.get(self.name, "") + keys
         if self.name == "password" and keys == "\ue006":       # Keys.RETURN
-            self.page.logged_in = True
+            self.page.submit()
 
     def click(self):
         if self.name == "graphs":
-            self.page.handles.append("graphs-tab")      # opens a new tab
+            self.page.open_graphs()
 
 
 class _ScSwitch:
@@ -572,15 +572,23 @@ class _ScSwitch:
 
 
 class _ScDriver:
-    """Login page -> home page -> real time graphs in a new tab."""
+    """Login page -> home page -> real time graphs in a new tab.
 
-    def __init__(self, values, placeholder_reads=2):
+    logout_after: the site logs out after that many good readings, and again
+    after every `logout_after` readings following each login.
+    """
+
+    def __init__(self, values, placeholder_reads=2, logout_after=None,
+                 reject_login=False):
         from spp.scada.sherburne_city import XPATHS
 
         self.by_xpath = {v: k for k, v in XPATHS.items()}
         self.values = list(values)
         self.placeholder = placeholder_reads
-        self.typed, self.logged_in, self.visited = {}, False, []
+        self.logout_after, self.reject_login = logout_after, reject_login
+        self.reads_since_login = 0
+        self.typed, self.visited = {}, []
+        self.logged_in, self.page, self.logins = False, "blank", 0
         self.handles = ["main"]
         self.current_window_handle = "main"
         self.switch_to = _ScSwitch(self)
@@ -590,25 +598,39 @@ class _ScDriver:
 
     def get(self, url):
         self.visited.append(url)
+        self.page = "home" if self.logged_in else "login"
+
+    def submit(self):
+        if not self.reject_login:
+            self.logged_in, self.page = True, "home"
+            self.logins += 1
+            self.reads_since_login = 0
+
+    def open_graphs(self):
+        self.handles.append(f"graphs-tab-{len(self.handles)}")   # a new tab
+        self.page = "graphs"
 
     def quit(self):
         self.quit_called = True
 
     def text_of(self, name):
-        if name == "demand":
-            if self.placeholder:
-                self.placeholder -= 1
-                return ""
-            return self.values.pop(0) if len(self.values) > 1 else self.values[0]
-        return ""
+        if name != "demand":
+            return ""
+        if self.placeholder:
+            self.placeholder -= 1
+            return ""
+        value = self.values.pop(0) if len(self.values) > 1 else self.values[0]
+        self.reads_since_login += 1
+        if self.logout_after and self.reads_since_login >= self.logout_after:
+            self.logged_in, self.page = False, "login"     # session ends
+        return value
 
     def find_element(self, by, value):
         from selenium.common.exceptions import NoSuchElementException
 
         name = self.by_xpath.get(value)
-        visible = {"email", "password"} if not self.logged_in else {"graphs"}
-        if self.current_window_handle == "graphs-tab":
-            visible = {"demand"}
+        visible = {"login": {"email", "password"}, "home": {"graphs"},
+                   "graphs": {"demand"}}.get(self.page, set())
         if name not in visible:
             raise NoSuchElementException(value)
         return _ScElem(self, name)
@@ -622,56 +644,135 @@ def _sc_env(monkeypatch):
     monkeypatch.setenv("SC_PWD", "pw")
     monkeypatch.setenv("SC_PAGE_WAIT", "5")
     monkeypatch.delenv("SC_VALUE_UNIT", raising=False)
-    monkeypatch.setattr(sherburne_city.time, "sleep", lambda s: None)
+    monkeypatch.delenv("SC_READ_INTERVAL", raising=False)
+    # A fake clock: sleeping moves it forward, nothing waits.
+    clock = [1000.0]
+    monkeypatch.setattr(sherburne_city.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sherburne_city.time, "sleep",
+                        lambda s: clock.__setitem__(0, clock[0] + s))
     return sherburne_city
+
+
+def _collect(sc, monkeypatch):
+    writer = sc.Writer(dry_run=True)
+    got = []
+    monkeypatch.setattr(writer, "add", got.append)
+    return writer, got
 
 
 def test_sherburne_cycle_logs_in_once_and_reads_each_minute(monkeypatch):
     sc = _sc_env(monkeypatch)
     driver = _ScDriver(["21,500", "21,640", "21,700"])
     monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
-    writer = sc.Writer(dry_run=True)
-    got = []
-    monkeypatch.setattr(writer, "add", got.append)
+    writer, got = _collect(sc, monkeypatch)
     assert sc.run_cycle(writer, reads=3) == 3
-    assert driver.visited == ["https://portal/login"]          # one login
+    assert driver.visited == ["https://portal/login"] and driver.logins == 1
     assert driver.typed == {"email": "ops@example.com", "password": "pw\ue006"}
-    assert driver.current_window_handle == "graphs-tab"
+    assert driver.current_window_handle.startswith("graphs-tab")
     assert [r.mw_reading for r in got] == [Decimal("21.500"), Decimal("21.640"),
                                             Decimal("21.700")]   # kW -> MW
     assert {r.location for r in got} == {"SHERBURNE_CITY"}
     assert driver.quit_called
 
 
+def test_sherburne_logs_in_again_when_the_site_logs_out(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    driver = _ScDriver(["1000", "2000", "3000", "4000"], placeholder_reads=0,
+                       logout_after=2)
+    monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
+    writer, got = _collect(sc, monkeypatch)
+    assert sc.run_cycle(writer, reads=4) == 4         # no reading lost
+    assert driver.logins == 2
+    assert driver.visited == ["https://portal/login"] * 2
+    assert [r.mw_reading for r in got] == [Decimal(x) for x in
+                                            ("1.000", "2.000", "3.000", "4.000")]
+
+
+def test_sherburne_gives_up_after_max_relogins(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    driver = _ScDriver(["1000"], placeholder_reads=0, logout_after=1)
+    monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
+    writer, got = _collect(sc, monkeypatch)
+    sc.run_cycle(writer, reads=15)
+    assert driver.logins == 1 + sc.MAX_RELOGINS
+    assert len(got) == 1 + sc.MAX_RELOGINS            # one reading per login
+    assert driver.quit_called
+
+
+def test_sherburne_login_link_on_a_live_session_skips_the_form(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    driver = _ScDriver(["1000"], placeholder_reads=0)
+    driver.logged_in = True                           # session still valid
+    driver.get("https://portal/login")
+    sc.login(driver)
+    assert driver.typed == {} and driver.page == "home"
+
+
 def test_sherburne_bad_login_is_reported(monkeypatch):
     sc = _sc_env(monkeypatch)
     monkeypatch.setenv("SC_PAGE_WAIT", "0")
-    driver = _ScDriver(["1"])
-    driver.find_element_orig = driver.find_element
-
-    def never_logs_in(by, value):
-        driver.logged_in = False
-        return driver.find_element_orig(by, value)
-
-    driver.find_element = never_logs_in
+    driver = _ScDriver(["1"], reject_login=True)
     monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
     with pytest.raises(sc.LoginFailed):
         sc.run_cycle(sc.Writer(dry_run=True), reads=2)
     assert driver.quit_called
 
 
-def test_sherburne_three_bad_reads_end_the_cycle(monkeypatch):
+def test_sherburne_three_bad_reads_log_in_again(monkeypatch):
     sc = _sc_env(monkeypatch)
     monkeypatch.setenv("SC_PAGE_WAIT", "0")
-    driver = _ScDriver(["999999999"], placeholder_reads=0)     # above the ceiling
+    driver = _ScDriver(["1000"], placeholder_reads=0)
     monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
     reads = []
-    monkeypatch.setattr(sc, "read_once",
-                        lambda d: reads.append(1) or (_ for _ in ()).throw(
-                            sc.ReadingRejected("too big")))
+
+    def read_once(d):
+        reads.append(1)
+        raise sc.ReadingRejected("too big")
+
+    monkeypatch.setattr(sc, "read_once", read_once)
     with pytest.raises(sc.ReadingUnavailable):
         sc.run_cycle(sc.Writer(dry_run=True), reads=15)
-    assert len(reads) == sc.MAX_READ_FAILURES
+    # Every 3 failures it opens the login link again (the session is still
+    # valid, so no form) and retries; once MAX_RELOGINS are used, the next
+    # 3 failures end the cycle.
+    assert len(driver.visited) == 1 + sc.MAX_RELOGINS
+    n = sc.MAX_READ_FAILURES
+    assert len(reads) == (n + (n - 1) * sc.MAX_RELOGINS) + sc.MAX_RELOGINS
+
+
+def test_sherburne_scheduled_cycle_ends_before_the_next_run(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    driver = _ScDriver(["1000"], placeholder_reads=0)
+    monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
+    writer, got = _collect(sc, monkeypatch)
+    assert sc.run_cycle(writer, reads=15, max_seconds=sc.SCHEDULED_CYCLE_SECONDS) == 15
+    writer, got = _collect(sc, monkeypatch)
+    assert sc.run_cycle(writer, reads=15, max_seconds=150) == 3   # 0, 60, 120 s
+
+
+def test_sherburne_scheduled_cycle_fails_when_rows_are_not_written(monkeypatch, tmp_path):
+    sc = _sc_env(monkeypatch)
+    monkeypatch.setenv("SPP_DSN", "postgresql://x/y")
+    monkeypatch.setenv("SC_MW_LOG", str(tmp_path / "mw.log"))
+    monkeypatch.setenv("SC_READS", "2")
+    driver = _ScDriver(["1000"], placeholder_reads=0)
+    monkeypatch.setattr(sc, "create_driver", lambda headless: driver)
+
+    def down(readings):
+        raise OSError("timed out")
+
+    monkeypatch.setattr(sc, "write_readings", down)
+    with pytest.raises(RuntimeError, match="2 of 2 reading"):
+        sc.run_scheduled_cycle()
+    monkeypatch.setattr(sc, "write_readings", lambda readings: len(readings))
+    assert sc.run_scheduled_cycle() == {"location": "SHERBURNE_CITY", "readings": 2}
+
+
+def test_sherburne_scheduled_cycle_needs_its_settings(monkeypatch):
+    sc = _sc_env(monkeypatch)
+    monkeypatch.delenv("SC_PWD")
+    with pytest.raises(sc.MissingConfiguration, match="SC_PWD"):
+        sc.run_scheduled_cycle()
 
 
 def test_sherburne_writer_keeps_readings_when_the_database_is_down(monkeypatch, tmp_path):

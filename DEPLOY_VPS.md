@@ -316,6 +316,7 @@ Edit `.env`. Set at minimum:
 |---|---|
 | `SPP_DSN` | `postgresql://spp:<password>@host.docker.internal:5432/spp` |
 | `BEATRICE_USER`, `BEATRICE_PWD`, `BEATRICE_LOGIN_URL`, `BEATRICE_SVG_URL` | The Beatrice HMI values |
+| `SC_LOGIN_LINK`, `SC_USER`, `SC_PWD` | The Sherburne login page, email and password |
 | `SCADA_CHROME_BINARY` | `/usr/bin/chromium` |
 | `SCADA_CHROMEDRIVER` | `/usr/bin/chromedriver` |
 
@@ -439,7 +440,7 @@ cd ~/spp_data_pipeline
 astro dev run variables set spp_rt_lmp_groups nppd,kmea
 astro dev run variables set spp_da_lmp_groups nppd,kmea
 
-for d in spp_rt_lmp spp_rt_mcp spp_day_ahead spp_gap_sweeper scada_beatrice; do
+for d in spp_rt_lmp spp_rt_mcp spp_day_ahead spp_gap_sweeper scada_beatrice scada_sherburne; do
     astro dev run dags unpause "$d"
 done
 ```
