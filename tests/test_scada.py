@@ -487,14 +487,16 @@ def test_import_legacy_csv(conn, tmp_path):
 # --------------------------------------------------------------------------- #
 # Sherburne city: standalone, one login per 15 readings (no browser)
 # --------------------------------------------------------------------------- #
-def test_sherburne_units():
+def test_sherburne_kw_becomes_mw(monkeypatch):
     from spp.scada.sherburne_city import (ReadingRejected, ReadingUnavailable,
-                                          parse_demand, unit_of)
+                                          parse_demand, value_unit)
 
-    assert unit_of("12,345 kW") == "kW"
-    assert unit_of("12.3 MW") == "MW"
-    assert unit_of("12.3", "kW") == "kW"
-    assert unit_of("12.3") == "MW"
+    monkeypatch.delenv("SC_VALUE_UNIT", raising=False)
+    assert value_unit() == "kW"                 # the page shows kW
+    assert parse_demand("7,483.2", "kW", ceiling=100) == Decimal("7.483")
+    assert parse_demand("7483.25", "kW", ceiling=100) == Decimal("7.483")
+    assert parse_demand("7483.5", "kW", ceiling=100) == Decimal("7.484")   # half-up
+    assert parse_demand("0", "kW", ceiling=100) == Decimal("0.000")
     assert parse_demand("12,345.6", "kW", ceiling=100) == Decimal("12.346")
     assert parse_demand("12.3456", "MW", ceiling=100) == Decimal("12.346")
     with pytest.raises(ReadingRejected):        # kW read as MW
@@ -573,10 +575,9 @@ class _ScDriver:
     """Login page -> home page -> real time graphs in a new tab."""
 
     def __init__(self, values, placeholder_reads=2):
-        from spp.scada.sherburne_city import DEMAND_BOX, XPATHS
+        from spp.scada.sherburne_city import XPATHS
 
         self.by_xpath = {v: k for k, v in XPATHS.items()}
-        self.by_xpath[DEMAND_BOX] = "box"
         self.values = list(values)
         self.placeholder = placeholder_reads
         self.typed, self.logged_in, self.visited = {}, False, []
@@ -599,8 +600,6 @@ class _ScDriver:
                 self.placeholder -= 1
                 return ""
             return self.values.pop(0) if len(self.values) > 1 else self.values[0]
-        if name == "box":
-            return "kW"
         return ""
 
     def find_element(self, by, value):
@@ -609,7 +608,7 @@ class _ScDriver:
         name = self.by_xpath.get(value)
         visible = {"email", "password"} if not self.logged_in else {"graphs"}
         if self.current_window_handle == "graphs-tab":
-            visible = {"demand", "box"}
+            visible = {"demand"}
         if name not in visible:
             raise NoSuchElementException(value)
         return _ScElem(self, name)

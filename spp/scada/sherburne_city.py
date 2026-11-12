@@ -11,8 +11,9 @@ One CYCLE is one login and SC_READS readings (default 15), one a minute:
 
     1. open SC_LOGIN_LINK, type SC_USER and SC_PWD, press Enter
     2. click "View real time graphs"
-    3. read the "Demand now" value once a minute and write each reading to
-       mw_updates as location SHERBURNE_CITY
+    3. read the "Demand now" value once a minute, divide it by 1000 (the
+       page shows kW) and write each reading to mw_updates as location
+       SHERBURNE_CITY, in MW
 
 then Chrome closes and the next cycle logs in again, so a new login happens
 about every 15 minutes.
@@ -51,7 +52,7 @@ Environment (or a .env file in the working directory or above):
     SC_READS             readings per login                      (default 15)
     SC_READ_INTERVAL     seconds between readings                (default 60)
     SC_PAGE_WAIT         seconds to wait for a page or a value   (default 30)
-    SC_VALUE_UNIT        MW or kW, used when the page shows no unit (default MW)
+    SC_VALUE_UNIT        unit the page shows: kW (divided by 1000) or MW (default kW)
     SC_MW_CEIL           upper sanity limit, MW                  (default 100)
     SC_MW_LOG            reading log file   (default logs/sherburne_mw_log.txt)
     SCADA_LOG_FILE       also write the log to this rotating file
@@ -99,8 +100,6 @@ XPATHS = {
     "graphs":   '//*[@id="root"]/div[1]/main/div[4]/div/a[1]/span',
     "demand":   '//*[@id="peak-body-7"]/div[1]/div[1]/div[2]/span[1]',
 }
-# The element around the value; its text includes the unit if the page shows one.
-DEMAND_BOX = XPATHS["demand"].rsplit("/", 1)[0]
 
 # Waits that retry while the page is still drawing.
 _WAIT_IGNORES = (NoSuchElementException, StaleElementReferenceException,
@@ -133,8 +132,9 @@ def ceiling() -> float:
     return _env_float("SC_MW_CEIL", 100)
 
 
-def default_unit() -> str:
-    unit = (os.environ.get("SC_VALUE_UNIT") or "MW").strip()
+def value_unit() -> str:
+    """Unit of the 'Demand now' value: kW (the page's unit) unless set to MW."""
+    unit = (os.environ.get("SC_VALUE_UNIT") or "kW").strip()
     if unit.lower() not in ("mw", "kw"):
         raise MissingConfiguration(f"SC_VALUE_UNIT must be MW or kW, not {unit!r}")
     return "kW" if unit.lower() == "kw" else "MW"
@@ -245,17 +245,12 @@ def parse_mw_text(text: str, *, floor: float | None = None,
     return value.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
 
 
-def unit_of(box_text: str, default: str = "MW") -> str:
-    """'12,345 kW' -> 'kW', '12.3 MW' -> 'MW', '12.3' -> default."""
-    if re.search(r"\bkw\b", box_text or "", re.IGNORECASE):
-        return "kW"
-    if re.search(r"\bmw\b", box_text or "", re.IGNORECASE):
-        return "MW"
-    return default
-
-
 def parse_demand(value_text: str, unit: str, *, ceiling: float) -> Decimal:
-    """Display value in `unit` -> MW, half-up 3 dp, in [0, ceiling] MW."""
+    """Display value in `unit` -> MW, half-up 3 dp, in [0, ceiling] MW.
+
+    '7,483.2' kW -> Decimal('7.483'). The division happens before rounding,
+    so no precision is lost.
+    """
     if unit == "kW":
         match = _NUMBER.search((value_text or "").replace(",", ""))
         if not match:
@@ -362,8 +357,8 @@ def open_real_time_graphs(driver) -> None:
     logger.info("real time graphs page open")
 
 
-def read_demand_text(driver) -> tuple[str, str]:
-    """Wait until 'Demand now' shows a number; return (value text, box text).
+def read_demand_text(driver) -> str:
+    """Wait until 'Demand now' shows a number; return its text.
 
     The field can show a blank or a placeholder while the page fetches the
     value, so this waits for a number rather than for the element.
@@ -379,18 +374,14 @@ def read_demand_text(driver) -> tuple[str, str]:
             value_text = _element_text(driver.find_element(By.XPATH, XPATHS["demand"]))
         except NoSuchElementException:
             raise NoSuchElementException("'Demand now' is gone from the page") from None
-    try:
-        box_text = _element_text(driver.find_element(By.XPATH, DEMAND_BOX))
-    except (NoSuchElementException, StaleElementReferenceException):
-        box_text = value_text
-    return value_text, box_text
+    return value_text
 
 
 def read_once(driver) -> Reading:
-    value_text, box_text = read_demand_text(driver)
-    unit = unit_of(box_text, default_unit())
-    logger.debug(f"Demand now text: {value_text!r} (box {box_text!r}, unit {unit})")
+    value_text = read_demand_text(driver)
+    unit = value_unit()
     mw = parse_demand(value_text, unit, ceiling=ceiling())
+    logger.debug(f"Demand now text {value_text!r} {unit} -> {mw} MW")
     return Reading.from_aware(LOCATION, datetime.now(CENTRAL), mw)
 
 
@@ -613,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
     headless = not args.headed
     try:
         check_env(*REQUIRED, *(() if args.dry_run else ("SPP_DSN",)))
-        default_unit()
+        value_unit()
     except MissingConfiguration as exc:
         logger.error(str(exc))
         return 2
