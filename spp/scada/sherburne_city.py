@@ -11,9 +11,9 @@ One CYCLE is one login and SC_READS readings (default 15), one a minute:
 
     1. open SC_LOGIN_LINK, type SC_USER and SC_PWD, press Enter
     2. click "View real time graphs"
-    3. read the "Demand now" value once a minute, divide it by 1000 (the
-       page shows kW) and write each reading to mw_updates as location
-       SHERBURNE_CITY, in MW
+    3. once a minute, read the site load ("Demand now") and the town peak
+       load, divide each by 1000 (the page shows kW) and write them to
+       mw_updates as SHERBURNE_CITY and SHERBURNE_CITY_PEAK, in MW
 
 then Chrome closes and the next cycle logs in again, so a new login happens
 about every 15 minutes. If the site logs the scraper out during a cycle (the
@@ -45,7 +45,8 @@ reading is one row of mw_updates:
     timestamp_id       spine id of the 5-minute interval that contains the
                        reading: '<Excel date serial>HB<hh>MB<mm>', Central
                        wall clock, e.g. 10:47:11 on 2026-11-08 -> '46334HB10MB45'
-    location           SHERBURNE_CITY (a row of scada_locations)
+    location           SHERBURNE_CITY | SHERBURNE_CITY_PEAK (rows of
+                       scada_locations)
     reading_timestamp  Central wall-clock read time, without a time zone
     mw_reading         MW, rounded half-up to 3 decimals
 
@@ -102,14 +103,23 @@ CENTRAL = ZoneInfo("America/Chicago")
 TABLE = "mw_updates"
 REQUIRED = ("SC_LOGIN_LINK", "SC_USER", "SC_PWD")
 
-# mw_updates.location code (a row of scada_locations).
-LOCATION = "SHERBURNE_CITY"
+# mw_updates.location codes (rows of scada_locations).
+LOCATION = "SHERBURNE_CITY"            # site load ("Demand now")
+PEAK = "SHERBURNE_CITY_PEAK"           # town peak load
+LOCATIONS = (LOCATION, PEAK)
+
+# Meter keys on the real-time graphs page map to location codes.
+METERS = {
+    "demand": LOCATION,
+    "peak":   PEAK,
+}
 
 XPATHS = {
     "email":    '//*[@id="email"]',
     "password": '//*[@id="password"]',
     "graphs":   '//*[@id="root"]/div[1]/main/div[4]/div/a[1]/span',
     "demand":   '//*[@id="peak-body-7"]/div[1]/div[1]/div[2]/span[1]',
+    "peak":     '//*[@id="peak-body-7"]/div[1]/div[2]/div[2]/span[1]',
 }
 
 # Waits that retry while the page is still drawing.
@@ -401,23 +411,27 @@ def open_real_time_graphs(driver) -> None:
     logger.info("real time graphs page open")
 
 
-def read_demand_text(driver) -> str:
-    """Wait until 'Demand now' shows a number; return its text.
+def read_meter_text(driver, meter: str) -> str:
+    """Wait until the meter shows a number; return its text.
 
     The field can show a blank or a placeholder while the page fetches the
     value, so this waits for a number rather than for the element.
     """
+    xpath = XPATHS[meter]
+    label = "Demand now" if meter == "demand" else "town peak"
+
     def shown(d):
-        text = _element_text(d.find_element(By.XPATH, XPATHS["demand"]))
+        text = _element_text(d.find_element(By.XPATH, xpath))
         return text if _NUMBER.search(text.replace(",", "")) else False
 
     try:
         value_text = _wait(driver).until(shown)
     except TimeoutException:
         try:
-            value_text = _element_text(driver.find_element(By.XPATH, XPATHS["demand"]))
+            value_text = _element_text(driver.find_element(By.XPATH, xpath))
         except NoSuchElementException:
-            raise NoSuchElementException("'Demand now' is gone from the page") from None
+            raise NoSuchElementException(
+                f"{label} is gone from the page") from None
     return value_text
 
 
@@ -430,12 +444,31 @@ def logged_out(driver) -> bool:
         return False
 
 
-def read_once(driver) -> Reading:
-    value_text = read_demand_text(driver)
+def read_once(driver) -> list[Reading]:
+    """Read site load and town peak; skip a meter that cannot be parsed.
+
+    Both readings share the same Central wall-clock read time. Raises
+    ReadingUnavailable when neither meter yields a usable value.
+    """
+    read_at = datetime.now(CENTRAL)
     unit = value_unit()
-    mw = parse_demand(value_text, unit, ceiling=ceiling())
-    logger.debug(f"Demand now text {value_text!r} {unit} -> {mw} MW")
-    return Reading.from_aware(LOCATION, datetime.now(CENTRAL), mw)
+    limit = ceiling()
+    readings: list[Reading] = []
+    errors: list[Exception] = []
+    for meter, location in METERS.items():
+        try:
+            value_text = read_meter_text(driver, meter)
+            mw = parse_demand(value_text, unit, ceiling=limit)
+        except (ValueError, NoSuchElementException, TimeoutException) as exc:
+            errors.append(exc)
+            logger.error(f"{location} not read: {exc}")
+            continue
+        logger.debug(f"{location} text {value_text!r} {unit} -> {mw} MW")
+        readings.append(Reading.from_aware(location, read_at, mw))
+    if not readings:
+        raise ReadingUnavailable(
+            f"no Sherburne reading ({'; '.join(str(e) for e in errors)})")
+    return readings
 
 
 # --------------------------------------------------------------------------- #
@@ -572,7 +605,8 @@ def run_cycle(writer: Writer, *, headless: bool = True,
     def take(i: int) -> None:
         if logged_out(driver):
             raise LoggedOut("the site logged out (login form shown)")
-        writer.add(read_once(driver))
+        for reading in read_once(driver):
+            writer.add(reading)
 
     def log_in_again() -> bool:
         nonlocal relogins
@@ -653,9 +687,9 @@ def run_scheduled_cycle(max_seconds: float = SCHEDULED_CYCLE_SECONDS) -> dict:
     good = run_cycle(writer, headless=True, max_seconds=max_seconds)
     writer.flush()
     if writer.pending:
-        raise RuntimeError(f"{len(writer.pending)} of {good} reading(s) not "
+        raise RuntimeError(f"{len(writer.pending)} reading(s) not "
                            "written to the database")
-    return {"location": LOCATION, "readings": good}
+    return {"locations": list(LOCATIONS), "readings": good}
 
 
 def scrape_continuous(*, headless: bool = True, dry_run: bool = False,

@@ -59,14 +59,15 @@ def scada_beatrice():
 scada_beatrice()
 
 
-SHERBURNE_DOC = """Sherburne city load (SHERBURNE_CITY), every 15 minutes.
+SHERBURNE_DOC = """Sherburne site load and town peak (SHERBURNE_CITY,
+SHERBURNE_CITY_PEAK), every 15 minutes.
 
 Each run is one cycle of spp/scada/sherburne_city.py: headless Chromium logs
-in (SC_LOGIN_LINK, SC_USER, SC_PWD), clicks "View real time graphs" and reads
-"Demand now" (kW, divided by 1000) once a minute, 15 times. Each reading is
-written to `mw_updates` as soon as it is taken. If the site logs out during
-the run, or three readings in a row fail, the task logs in again in the same
-browser (up to 3 times) and carries on.
+in (SC_LOGIN_LINK, SC_USER, SC_PWD), clicks "View real time graphs" and once
+a minute reads site load ("Demand now") and town peak (kW, divided by 1000),
+15 times. Each reading is written to `mw_updates` as soon as it is taken. If
+the site logs out during the run, or three readings in a row fail, the task
+logs in again in the same browser (up to 3 times) and carries on.
 
 The task takes about 14.5 minutes and stops reading before the next run is
 due. No retries: a retry would start late and overlap the next run, which

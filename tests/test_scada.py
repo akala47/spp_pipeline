@@ -102,9 +102,9 @@ def test_scraper_codes_are_in_the_schema():
     from spp.scada import beatrice, garden_city, sherburne_city
 
     root = Path(__file__).resolve().parent.parent / "schema"
-    want = {beatrice.LOCATION, *garden_city.XPATHS, sherburne_city.LOCATION}
+    want = {beatrice.LOCATION, *garden_city.XPATHS, *sherburne_city.LOCATIONS}
     assert want == {"BEATRICE", "GC_JAMESON", "GC_LEWIS", "GC_TOTAL",
-                    "SHERBURNE_CITY"}
+                    "SHERBURNE_CITY", "SHERBURNE_CITY_PEAK"}
 
     def seeded(*files):
         text = "".join((root / f).read_text() for f in files)
@@ -113,7 +113,8 @@ def test_scraper_codes_are_in_the_schema():
     assert want <= seeded("01_schema.sql")
     assert want <= seeded("patches/2026-11-06_scada_locations.sql",
                           "patches/2026-11-08_gc_total.sql",
-                          "patches/2026-11-11_sherburne_city.sql")
+                          "patches/2026-11-11_sherburne_city.sql",
+                          "patches/2026-11-16_sherburne_city_peak.sql")
 
 
 # --------------------------------------------------------------------------- #
@@ -440,7 +441,7 @@ def test_scraper_codes_are_registered(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT location FROM scada_locations")
         codes = {r[0] for r in cur.fetchall()}
-    assert {beatrice.LOCATION, *garden_city.XPATHS, sherburne_city.LOCATION} <= codes
+    assert {beatrice.LOCATION, *garden_city.XPATHS, *sherburne_city.LOCATIONS} <= codes
 
 
 @db_only
@@ -575,7 +576,9 @@ class _ScDriver:
     """Login page -> home page -> real time graphs in a new tab.
 
     logout_after: the site logs out after that many good readings, and again
-    after every `logout_after` readings following each login.
+    after every `logout_after` readings following each login. Each reading
+    tick serves the same display text for demand and peak; the tick advances
+    once both meters have been read.
     """
 
     def __init__(self, values, placeholder_reads=2, logout_after=None,
@@ -593,6 +596,8 @@ class _ScDriver:
         self.current_window_handle = "main"
         self.switch_to = _ScSwitch(self)
         self.quit_called = False
+        self._tick_value = None
+        self._served = set()
 
     window_handles = property(lambda self: list(self.handles))
 
@@ -614,15 +619,23 @@ class _ScDriver:
         self.quit_called = True
 
     def text_of(self, name):
-        if name != "demand":
+        if name not in ("demand", "peak"):
             return ""
         if self.placeholder:
             self.placeholder -= 1
             return ""
-        value = self.values.pop(0) if len(self.values) > 1 else self.values[0]
-        self.reads_since_login += 1
-        if self.logout_after and self.reads_since_login >= self.logout_after:
-            self.logged_in, self.page = False, "login"     # session ends
+        if self._tick_value is None:
+            self._tick_value = (self.values.pop(0) if len(self.values) > 1
+                                else self.values[0])
+            self._served = set()
+        self._served.add(name)
+        value = self._tick_value
+        if self._served >= {"demand", "peak"}:
+            self._tick_value = None
+            self._served = set()
+            self.reads_since_login += 1
+            if self.logout_after and self.reads_since_login >= self.logout_after:
+                self.logged_in, self.page = False, "login"     # session ends
         return value
 
     def find_element(self, by, value):
@@ -630,7 +643,7 @@ class _ScDriver:
 
         name = self.by_xpath.get(value)
         visible = {"login": {"email", "password"}, "home": {"graphs"},
-                   "graphs": {"demand"}}.get(self.page, set())
+                   "graphs": {"demand", "peak"}}.get(self.page, set())
         if name not in visible:
             raise NoSuchElementException(value)
         return _ScElem(self, name)
@@ -669,9 +682,13 @@ def test_sherburne_cycle_logs_in_once_and_reads_each_minute(monkeypatch):
     assert driver.visited == ["https://portal/login"] and driver.logins == 1
     assert driver.typed == {"email": "ops@example.com", "password": "pw\ue006"}
     assert driver.current_window_handle.startswith("graphs-tab")
-    assert [r.mw_reading for r in got] == [Decimal("21.500"), Decimal("21.640"),
-                                            Decimal("21.700")]   # kW -> MW
-    assert {r.location for r in got} == {"SHERBURNE_CITY"}
+    # Each tick writes site load and town peak (same kW display -> MW).
+    assert [r.mw_reading for r in got] == [
+        Decimal("21.500"), Decimal("21.500"),
+        Decimal("21.640"), Decimal("21.640"),
+        Decimal("21.700"), Decimal("21.700"),
+    ]
+    assert {r.location for r in got} == {"SHERBURNE_CITY", "SHERBURNE_CITY_PEAK"}
     assert driver.quit_called
 
 
@@ -684,8 +701,10 @@ def test_sherburne_logs_in_again_when_the_site_logs_out(monkeypatch):
     assert sc.run_cycle(writer, reads=4) == 4         # no reading lost
     assert driver.logins == 2
     assert driver.visited == ["https://portal/login"] * 2
-    assert [r.mw_reading for r in got] == [Decimal(x) for x in
-                                            ("1.000", "2.000", "3.000", "4.000")]
+    assert [r.mw_reading for r in got] == [
+        Decimal(x) for x in ("1.000", "1.000", "2.000", "2.000",
+                             "3.000", "3.000", "4.000", "4.000")]
+    assert {r.location for r in got} == {"SHERBURNE_CITY", "SHERBURNE_CITY_PEAK"}
 
 
 def test_sherburne_gives_up_after_max_relogins(monkeypatch):
@@ -695,7 +714,8 @@ def test_sherburne_gives_up_after_max_relogins(monkeypatch):
     writer, got = _collect(sc, monkeypatch)
     sc.run_cycle(writer, reads=15)
     assert driver.logins == 1 + sc.MAX_RELOGINS
-    assert len(got) == 1 + sc.MAX_RELOGINS            # one reading per login
+    # One tick (site + peak) per login before the site logs out again.
+    assert len(got) == 2 * (1 + sc.MAX_RELOGINS)
     assert driver.quit_called
 
 
@@ -762,10 +782,13 @@ def test_sherburne_scheduled_cycle_fails_when_rows_are_not_written(monkeypatch, 
         raise OSError("timed out")
 
     monkeypatch.setattr(sc, "write_readings", down)
-    with pytest.raises(RuntimeError, match="2 of 2 reading"):
+    with pytest.raises(RuntimeError, match="4 reading"):
         sc.run_scheduled_cycle()
     monkeypatch.setattr(sc, "write_readings", lambda readings: len(readings))
-    assert sc.run_scheduled_cycle() == {"location": "SHERBURNE_CITY", "readings": 2}
+    assert sc.run_scheduled_cycle() == {
+        "locations": ["SHERBURNE_CITY", "SHERBURNE_CITY_PEAK"],
+        "readings": 2,
+    }
 
 
 def test_sherburne_scheduled_cycle_needs_its_settings(monkeypatch):

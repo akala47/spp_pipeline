@@ -6,7 +6,7 @@ scripts; only the transform and load (spp.scada.common) are new.
 
     timestamp_id       spine id of the 5-minute interval the reading falls in
     location           'BEATRICE' | 'GC_JAMESON' | 'GC_LEWIS' | 'GC_TOTAL' |
-                       'SHERBURNE_CITY'
+                       'SHERBURNE_CITY' | 'SHERBURNE_CITY_PEAK'
     reading_timestamp  Central wall-clock time the reading was taken
     mw_reading         MW, rounded half-up to 3 decimals
 
