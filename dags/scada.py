@@ -59,12 +59,12 @@ def scada_beatrice():
 scada_beatrice()
 
 
-SHERBURNE_DOC = """Sherburne site load and town peak (SHERBURNE_CITY,
+SHERBURNE_DOC = """Sherburne Current Demand and Monthly Peak (SHERBURNE_CITY,
 SHERBURNE_CITY_PEAK), every 15 minutes.
 
 Each run is one cycle of spp/scada/sherburne_city.py: headless Chromium logs
-in (SC_LOGIN_LINK, SC_USER, SC_PWD), clicks "View real time graphs" and once
-a minute reads site load ("Demand now") and town peak (kW, divided by 1000),
+in (SC_LOGIN_LINK, SC_USER, SC_PWD), lands on the Pulse Connex dashboard, and
+once a minute reads Current Demand and Monthly Peak (kW, divided by 1000),
 15 times. Each reading is written to `mw_updates` as soon as it is taken. If
 the site logs out during the run, or three readings in a row fail, the task
 logs in again in the same browser (up to 3 times) and carries on.

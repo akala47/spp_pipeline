@@ -560,8 +560,7 @@ class _ScElem:
             self.page.submit()
 
     def click(self):
-        if self.name == "graphs":
-            self.page.open_graphs()
+        pass
 
 
 class _ScSwitch:
@@ -573,7 +572,7 @@ class _ScSwitch:
 
 
 class _ScDriver:
-    """Login page -> home page -> real time graphs in a new tab.
+    """Login page -> Pulse Connex dashboard (Current Demand + Monthly Peak).
 
     logout_after: the site logs out after that many good readings, and again
     after every `logout_after` readings following each login. Each reading
@@ -603,17 +602,13 @@ class _ScDriver:
 
     def get(self, url):
         self.visited.append(url)
-        self.page = "home" if self.logged_in else "login"
+        self.page = "dashboard" if self.logged_in else "login"
 
     def submit(self):
         if not self.reject_login:
-            self.logged_in, self.page = True, "home"
+            self.logged_in, self.page = True, "dashboard"
             self.logins += 1
             self.reads_since_login = 0
-
-    def open_graphs(self):
-        self.handles.append(f"graphs-tab-{len(self.handles)}")   # a new tab
-        self.page = "graphs"
 
     def quit(self):
         self.quit_called = True
@@ -642,8 +637,8 @@ class _ScDriver:
         from selenium.common.exceptions import NoSuchElementException
 
         name = self.by_xpath.get(value)
-        visible = {"login": {"email", "password"}, "home": {"graphs"},
-                   "graphs": {"demand", "peak"}}.get(self.page, set())
+        visible = {"login": {"email", "password"},
+                   "dashboard": {"demand", "peak"}}.get(self.page, set())
         if name not in visible:
             raise NoSuchElementException(value)
         return _ScElem(self, name)

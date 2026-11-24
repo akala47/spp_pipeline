@@ -10,10 +10,10 @@ On Windows also install tzdata (Windows has no time zone database).
 One CYCLE is one login and SC_READS readings (default 15), one a minute:
 
     1. open SC_LOGIN_LINK, type SC_USER and SC_PWD, press Enter
-    2. click "View real time graphs"
-    3. once a minute, read the site load ("Demand now") and the town peak
-       load, divide each by 1000 (the page shows kW) and write them to
-       mw_updates as SHERBURNE_CITY and SHERBURNE_CITY_PEAK, in MW
+    2. wait for the Pulse Connex dashboard (lands there after login)
+    3. once a minute, read Current Demand and Monthly Peak, divide each
+       by 1000 (the page shows kW) and write them to mw_updates as
+       SHERBURNE_CITY and SHERBURNE_CITY_PEAK, in MW
 
 then Chrome closes and the next cycle logs in again, so a new login happens
 about every 15 minutes. If the site logs the scraper out during a cycle (the
@@ -104,11 +104,11 @@ TABLE = "mw_updates"
 REQUIRED = ("SC_LOGIN_LINK", "SC_USER", "SC_PWD")
 
 # mw_updates.location codes (rows of scada_locations).
-LOCATION = "SHERBURNE_CITY"            # site load ("Demand now")
-PEAK = "SHERBURNE_CITY_PEAK"           # town peak load
+LOCATION = "SHERBURNE_CITY"            # Current Demand
+PEAK = "SHERBURNE_CITY_PEAK"           # Monthly Peak
 LOCATIONS = (LOCATION, PEAK)
 
-# Meter keys on the real-time graphs page map to location codes.
+# Meter keys on the dashboard map to location codes.
 METERS = {
     "demand": LOCATION,
     "peak":   PEAK,
@@ -117,9 +117,8 @@ METERS = {
 XPATHS = {
     "email":    '//*[@id="email"]',
     "password": '//*[@id="password"]',
-    "graphs":   '//*[@id="root"]/div[1]/main/div[4]/div/a[1]/span',
-    "demand":   '//*[@id="peak-body-7"]/div[1]/div[1]/div[2]/span[1]',
-    "peak":     '//*[@id="peak-body-7"]/div[1]/div[2]/div[2]/span[1]',
+    "demand":   '/html/body/div/div[1]/main/div[3]/section[1]/p[1]/span[1]',
+    "peak":     '/html/body/div/div[1]/main/div[3]/section[2]/p[1]/span[1]',
 }
 
 # Waits that retry while the page is still drawing.
@@ -156,7 +155,7 @@ def ceiling() -> float:
 
 
 def value_unit() -> str:
-    """Unit of the 'Demand now' value: kW (the page's unit) unless set to MW."""
+    """Unit of the dashboard values: kW (the page's unit) unless set to MW."""
     unit = (os.environ.get("SC_VALUE_UNIT") or "kW").strip()
     if unit.lower() not in ("mw", "kw"):
         raise MissingConfiguration(f"SC_VALUE_UNIT must be MW or kW, not {unit!r}")
@@ -248,7 +247,7 @@ class UnknownLocation(LookupError):
 
 
 class LoginFailed(RuntimeError):
-    """The login did not reach the page with 'View real time graphs'."""
+    """The login did not reach the Pulse Connex dashboard."""
 
 
 class LoggedOut(RuntimeError):
@@ -346,15 +345,15 @@ def _element_text(elem) -> str:
 
 
 def login(driver) -> None:
-    """Log in and wait for the page with 'View real time graphs'.
+    """Log in and wait for the Pulse Connex dashboard (Current Demand).
 
-    If the login link opens the home page instead of the form (the session
+    If the login link opens the dashboard instead of the form (the session
     is still valid), there is nothing to type.
     """
     driver.get(os.environ["SC_LOGIN_LINK"])
 
-    def form_or_home(d):
-        for name in ("email", "graphs"):
+    def form_or_dashboard(d):
+        for name in ("email", "demand"):
             try:
                 d.find_element(By.XPATH, XPATHS[name])
                 return name
@@ -363,11 +362,11 @@ def login(driver) -> None:
         return False
 
     try:
-        shown = _wait(driver).until(form_or_home)
+        shown = _wait(driver).until(form_or_dashboard)
     except TimeoutException:
         raise LoginFailed(f"no login form on {os.environ['SC_LOGIN_LINK']} "
                           f"after {page_wait():g} s") from None
-    if shown == "graphs":
+    if shown == "demand":
         logger.info("still logged in")
         return
     email = _find(driver, "email")
@@ -378,37 +377,24 @@ def login(driver) -> None:
     password.send_keys(os.environ["SC_PWD"])
     password.send_keys(Keys.RETURN)
     try:
-        _find(driver, "graphs")
+        _find(driver, "demand")
     except TimeoutException:
         raise LoginFailed(
-            f"'View real time graphs' not shown {page_wait():g} s after login; "
+            f"dashboard (Current Demand) not shown {page_wait():g} s after login; "
             "check SC_USER / SC_PWD and SC_LOGIN_LINK") from None
     logger.info("logged in")
 
 
-def open_real_time_graphs(driver) -> None:
-    """Click 'View real time graphs'; follow a new tab if it opens one."""
-    before = set(driver.window_handles)
-
-    def clicked(d):
-        d.find_element(By.XPATH, XPATHS["graphs"]).click()
-        return True
-
-    _wait(driver).until(clicked)
-
-    def demand_shown(d):
-        new = [h for h in d.window_handles if h not in before]
-        if new and d.current_window_handle != new[-1]:
-            d.switch_to.window(new[-1])
-        return d.find_element(By.XPATH, XPATHS["demand"])
-
+def wait_for_dashboard(driver) -> None:
+    """Wait until Current Demand is on the post-login dashboard."""
     try:
-        _wait(driver).until(demand_shown)
+        _wait(driver).until(
+            lambda d: d.find_element(By.XPATH, XPATHS["demand"]))
     except TimeoutException:
         raise NoSuchElementException(
-            f"'Demand now' not on the real time graphs page after {page_wait():g} s"
+            f"'Current Demand' not on the dashboard after {page_wait():g} s"
         ) from None
-    logger.info("real time graphs page open")
+    logger.info("dashboard open")
 
 
 def read_meter_text(driver, meter: str) -> str:
@@ -418,7 +404,7 @@ def read_meter_text(driver, meter: str) -> str:
     value, so this waits for a number rather than for the element.
     """
     xpath = XPATHS[meter]
-    label = "Demand now" if meter == "demand" else "town peak"
+    label = "Current Demand" if meter == "demand" else "Monthly Peak"
 
     def shown(d):
         text = _element_text(d.find_element(By.XPATH, xpath))
@@ -445,7 +431,7 @@ def logged_out(driver) -> bool:
 
 
 def read_once(driver) -> list[Reading]:
-    """Read site load and town peak; skip a meter that cannot be parsed.
+    """Read Current Demand and Monthly Peak; skip a meter that cannot be parsed.
 
     Both readings share the same Central wall-clock read time. Raises
     ReadingUnavailable when neither meter yields a usable value.
@@ -585,7 +571,7 @@ def _sleep_until(deadline: float) -> None:
 
 def run_cycle(writer: Writer, *, headless: bool = True,
               reads: int | None = None, max_seconds: float | None = None) -> int:
-    """Log in, open the graphs page, take `reads` readings a minute apart.
+    """Log in, wait for the dashboard, take `reads` readings a minute apart.
 
     Logs in again in the same browser when the site logs out (the login form
     is back) or MAX_READ_FAILURES readings in a row fail, up to MAX_RELOGINS
@@ -616,7 +602,7 @@ def run_cycle(writer: Writer, *, headless: bool = True,
         logger.warning(f"logging in again ({relogins} of {MAX_RELOGINS} this cycle)")
         try:
             login(driver)
-            open_real_time_graphs(driver)
+            wait_for_dashboard(driver)
             return True
         except (LoginFailed, WebDriverException) as exc:
             logger.error(f"logging in again failed: {exc}")
@@ -625,7 +611,7 @@ def run_cycle(writer: Writer, *, headless: bool = True,
     try:
         driver = create_driver(headless)
         login(driver)
-        open_real_time_graphs(driver)
+        wait_for_dashboard(driver)
         start = time.monotonic()
         for i in range(reads):
             due = start + i * interval
