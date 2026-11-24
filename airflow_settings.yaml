@@ -20,6 +20,13 @@ airflow:
     - pool_name:
       pool_slot:
       pool_description:
+  # Keep every entry here empty. `astro dev start` and `astro dev restart`
+  # send these objects to the Airflow API as the user admin:admin. Airflow
+  # now asks for a real login (FAB auth manager, DEPLOY_VPS.md step 16), so
+  # that request fails, and then the Astro command fails too (also the
+  # systemd unit and the nightly deploy). With empty entries, Astro sends no
+  # request. Set Variables with `astro dev run variables set ...` (step 9).
+  # The groups fall back to SPP_RT_LMP_GROUPS in .env, then config/groups.json.
   variables:
-    - variable_name: spp_rt_lmp_groups
-      variable_value: nppd,kmea
+    - variable_name:
+      variable_value:

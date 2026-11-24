@@ -9,17 +9,75 @@
 #   once-a-minute browser. Their Chrome options do not include
 #   --disable-dev-shm-usage, so give Chromium a larger /dev/shm than the
 #   Docker default of 64 MB.
+#
+# Login and public URL (DEPLOY_VPS.md, step 16):
+#   The Astro CLI sets these values in the `environment:` of each Airflow
+#   container. `environment:` wins over `.env`, so `!reset null` removes the
+#   Astro values and the values in `.env` apply:
+#     AIRFLOW__API__BASE_URL         Astro: http://localhost:8080
+#     AIRFLOW__API_AUTH__JWT_SECRET  Astro: the project name (public!)
+#     AIRFLOW__API__SECRET_KEY       Astro: the project name (public!)
+#   Set all three in `.env` (see .env.example), on the VPS and on your
+#   computer. If one is missing, Airflow makes a random key in each process:
+#   the UI login and the tasks then fail, but nobody can sign a token.
+#
+#   Write `!reset` on each service, as below. Compose ignores `!reset` in a
+#   YAML anchor (<<: *x): tested with compose-go v2.9.1 (Astro CLI 1.45).
+#
+#   AIRFLOW__CORE__AUTH_MANAGER: the FAB auth manager (users and hashed
+#   passwords in the Airflow database). It replaces the Astro default
+#   (Simple auth manager, everybody is admin with no login). The FAB
+#   provider is in requirements.txt. `airflow db migrate` (the Astro
+#   db-migration container) makes the FAB tables.
+#
+#   api-server: --proxy-headers and FORWARDED_ALLOW_IPS make uvicorn use
+#   X-Forwarded-Proto from Caddy, so the login cookies get the Secure flag.
+#   AIRFLOW__FAB__ENABLE_PROXY_FIX does the same for the FAB login pages.
+#   This trust is safe because the Astro CLI publishes the API server on
+#   127.0.0.1 only (airflow.expose_port=false): only Caddy on the VPS, and
+#   the Airflow containers, can connect to it.
 services:
+  db-migration:
+    # No env_file here (Astro template). It only needs the auth manager, so
+    # that `airflow db migrate` also makes the FAB tables.
+    environment:
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
   scheduler:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     shm_size: "1gb"
+    environment:
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      AIRFLOW__API__BASE_URL: !reset null
+      AIRFLOW__API_AUTH__JWT_SECRET: !reset null
+      AIRFLOW__API__SECRET_KEY: !reset null
   dag-processor:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      AIRFLOW__API__BASE_URL: !reset null
+      AIRFLOW__API_AUTH__JWT_SECRET: !reset null
+      AIRFLOW__API__SECRET_KEY: !reset null
   api-server:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    command:
+      - airflow
+      - api-server
+      - --proxy-headers
+    environment:
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      AIRFLOW__API__BASE_URL: !reset null
+      AIRFLOW__API_AUTH__JWT_SECRET: !reset null
+      AIRFLOW__API__SECRET_KEY: !reset null
+      FORWARDED_ALLOW_IPS: "*"
+      AIRFLOW__FAB__ENABLE_PROXY_FIX: "True"
   triggerer:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      AIRFLOW__API__BASE_URL: !reset null
+      AIRFLOW__API_AUTH__JWT_SECRET: !reset null
+      AIRFLOW__API__SECRET_KEY: !reset null

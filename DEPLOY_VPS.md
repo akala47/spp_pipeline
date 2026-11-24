@@ -33,6 +33,7 @@ For the VPS size, refer to README → [VPS configuration](README.md#vps-configur
 13. [Operation and maintenance](#13-operation-and-maintenance)
 14. [Troubleshooting](#14-troubleshooting)
 15. [Branches, CI and the nightly deploy](#15-branches-ci-and-the-nightly-deploy)
+16. [Serve the Airflow UI at https://etl.jmdajmda.com](#16-serve-the-airflow-ui-at-httpsetljmdajmdacom)
 
 ---
 
@@ -1038,3 +1039,350 @@ systemctl --user --failed                                # shows spp-deploy.serv
 ```bash
 systemctl --user disable --now spp-deploy.timer
 ```
+
+## 16. Serve the Airflow UI at https://etl.jmdajmda.com
+
+After this step, the Airflow UI is on the internet at
+`https://etl.jmdajmda.com`, and each person must log in with a user name and
+a password:
+
+```
+browser ──HTTPS 443──> Caddy on the VPS ──http──> 127.0.0.1:8080 Airflow API server
+        ──HTTP 80───> Caddy: redirect to https://   (login: FAB auth manager)
+```
+
+- **DNS:** Cloudflare. The record `etl` points at the VPS, with **DNS only**
+  (grey cloud).
+- **Caddy** (on the host, from the Caddy apt repository) gets and renews the
+  Let's Encrypt certificate by itself. Port 80 only redirects to HTTPS.
+- **Login:** the Airflow FAB auth manager. The users and their hashed
+  passwords are in the Airflow metadata database. No password is in Git.
+- **Port 8080** is not reachable from the internet. The Astro CLI publishes
+  the API server on `127.0.0.1` only.
+
+The files of this step in the repository:
+
+| File | What it does |
+|---|---|
+| `deploy/caddy/Caddyfile` | Caddy configuration: TLS, redirect, proxy to `127.0.0.1:8080` |
+| `docker-compose.override.yml` | FAB auth manager; takes the public URL and the secrets from `.env`; trusts the proxy headers |
+| `requirements.txt` | Adds `apache-airflow-providers-fab` (not in the Astro Runtime image) |
+| `plugins/astro_html_headers_fix.py` | Fixes an Astro Runtime bug that breaks the FAB login (see "Why" below) |
+| `airflow_settings.yaml` | All entries empty, so that `astro dev start` does not need the `admin:admin` login |
+| `.env.example` | The new `.env` values |
+
+Do the parts in this sequence. Caddy can get the certificate only after the
+DNS record and the ports are ready.
+
+### 16.1 Find the IP addresses of the VPS
+
+On the VPS:
+
+```bash
+ip -4 -brief addr show scope global      # the public IPv4 address (eth0)
+ip -6 -brief addr show scope global      # a public IPv6 address, if IPv6 is on
+```
+
+DigitalOcean also shows the addresses on the droplet page. Use only the
+public addresses (not `10.x` or `172.x`).
+
+### 16.2 Add the DNS record in Cloudflare
+
+1. Log in to `dash.cloudflare.com` and select the domain `jmdajmda.com`.
+2. Go to **DNS → Records → Add record**:
+
+   | Field | Value |
+   |---|---|
+   | Type | `A` |
+   | Name | `etl` |
+   | IPv4 address | the public IPv4 address of the VPS |
+   | Proxy status | **DNS only** (grey cloud). Click the orange cloud to change it. |
+   | TTL | Auto |
+
+3. Click **Save**.
+4. Only if step 16.1 shows a public IPv6 address: add a second record with
+   type `AAAA`, name `etl`, that IPv6 address, and **DNS only**. Do not add
+   an `AAAA` record if the VPS has no IPv6 address: Let's Encrypt can then
+   fail.
+
+Why **DNS only**: with the orange cloud, Cloudflare ends the TLS connection
+and sees all the traffic, and the Cloudflare SSL settings must then match.
+With DNS only, the browser connects directly to Caddy, and the setup in this
+step is complete.
+
+On your computer, make sure that the name points at the VPS. It can take a
+few minutes:
+
+```bash
+dig +short etl.jmdajmda.com A        # must show the VPS IPv4 address
+dig +short etl.jmdajmda.com AAAA     # the VPS IPv6 address, or nothing
+dig +short jmdajmda.com CAA          # nothing, or a line with letsencrypt.org
+```
+
+If the `A` query shows a different address (for example `104.x` or
+`172.67.x`), the record has the orange cloud. Change it to DNS only. If the
+`CAA` query shows lines and none of them contains `letsencrypt.org`, add a
+record in Cloudflare: type `CAA`, name `@`, tag "Only allow specific
+hostnames", CA domain name `letsencrypt.org`.
+
+### 16.3 Open ports 80 and 443
+
+On the VPS:
+
+```bash
+sudo ufw allow 80/tcp comment 'Caddy: redirect to HTTPS, Lets Encrypt'
+sudo ufw allow 443/tcp comment 'Caddy: Airflow UI'
+sudo ufw status verbose
+```
+
+In the **DigitalOcean cloud firewall** of the droplet (**Networking →
+Firewalls**), add two inbound rules: TCP 80 and TCP 443, sources "All IPv4"
+and "All IPv6". Do **not** add 8080, 6563 or another Astro port.
+
+### 16.4 Keep the Airflow API server on localhost
+
+As `spp`:
+
+```bash
+astro config set -g airflow.expose_port false
+astro config get -g airflow.expose_port      # false
+astro config get -g api-server.port          # 8080
+```
+
+With `expose_port` set to `false`, the Astro CLI publishes the API server and
+the Astro metadata Postgres on `127.0.0.1` only. Caddy connects to
+`127.0.0.1:8080`. If `api-server.port` is not `8080`, run
+`astro config set -g api-server.port 8080`. You make sure of the result in
+step 16.6.
+
+### 16.5 Set the public URL and the secrets in `.env`
+
+1. Get the version of the code that has this step. Make sure that the files
+   are there:
+
+   ```bash
+   cd ~/spp_data_pipeline
+   ls deploy/caddy/Caddyfile plugins/astro_html_headers_fix.py
+   grep providers-fab requirements.txt
+   ```
+
+2. Add the values to `.env`. The commands make two random secrets and do not
+   show them on the screen:
+
+   ```bash
+   cd ~/spp_data_pipeline
+   {
+     echo
+     echo '# Airflow UI: login and public URL (DEPLOY_VPS.md, step 16)'
+     echo 'AIRFLOW__API__BASE_URL=https://etl.jmdajmda.com'
+     echo "AIRFLOW__API_AUTH__JWT_SECRET=$(openssl rand -hex 32)"
+     echo "AIRFLOW__API__SECRET_KEY=$(openssl rand -hex 32)"
+     echo 'AIRFLOW__FAB__COOKIE_SECURE=True'
+   } >> .env
+   chmod 600 .env
+   ```
+
+3. Make sure that each name is in `.env` one time only. This command must
+   show nothing:
+
+   ```bash
+   grep -E '^AIRFLOW__' .env | cut -d= -f1 | sort | uniq -d
+   ```
+
+   If it shows a name, remove the older line of that name.
+
+| Value | Why |
+|---|---|
+| `AIRFLOW__API__BASE_URL` | Airflow makes its links and the login redirects with this URL. |
+| `AIRFLOW__API_AUTH__JWT_SECRET` | Signs the login tokens. The Astro default is the project name, which is public: with it, anybody could make a valid token. |
+| `AIRFLOW__API__SECRET_KEY` | Signs the sessions of the login pages. The Astro default is also the project name. |
+| `AIRFLOW__FAB__COOKIE_SECURE` | The browser sends the session cookie only over HTTPS. |
+
+Do not show these secrets in a chat, a ticket or a screenshot. To change
+them, edit `.env` and do step 16.6 again. All users must then log in again.
+
+### 16.6 Rebuild and restart Airflow
+
+```bash
+cd ~/spp_data_pipeline
+astro dev restart --wait 5m
+astro dev ps                               # all containers "Up"
+```
+
+The restart builds the image again (it installs the FAB provider) and runs
+`airflow db migrate`, which makes the FAB tables. This can take some minutes.
+
+Make sure of the result:
+
+```bash
+API=$(docker ps -qf name=api-server)
+docker exec "$API" printenv AIRFLOW__API__BASE_URL AIRFLOW__CORE__AUTH_MANAGER
+# https://etl.jmdajmda.com
+# airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+docker exec "$API" sh -c '[ ${#AIRFLOW__API_AUTH__JWT_SECRET} -ge 32 ] && [ ${#AIRFLOW__API__SECRET_KEY} -ge 32 ] && echo "secrets OK"'
+astro dev run plugins | grep spp_astro_html_headers_fix     # one line
+
+sudo ss -tlnp | grep -E ':(8080|6563) '
+# each line must show 127.0.0.1:8080 or 127.0.0.1:6563, not 0.0.0.0 or *
+
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/api/v2/monitor/health   # 200
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/api/v2/dags             # 401: a login is necessary
+```
+
+### 16.7 Make the users
+
+Each person gets a user. Make the first user with the role `Admin`:
+
+```bash
+cd ~/spp_data_pipeline
+astro dev bash
+airflow users create --role Admin --username <name> \
+    --firstname <first name> --lastname <last name> --email <email>
+# The command asks for the password two times.
+exit
+```
+
+Do not give the password with `--password`: the command line goes into the
+shell history.
+
+| Role | Can do |
+|---|---|
+| `Admin` | Everything, also make users and change Variables and Connections |
+| `Op` | Run and clear DAGs, change Variables and Connections |
+| `User` | Run and clear DAGs |
+| `Viewer` | Read only |
+
+Other user commands, in `astro dev bash`:
+
+```bash
+airflow users list
+airflow users reset-password --username <name>     # asks for the new password
+airflow users delete --username <name>
+```
+
+An Admin can also manage the users in the UI: **Security → Users**.
+
+The users are in the Astro metadata database. They stay after
+`astro dev restart` and a reboot. `astro dev kill` deletes them, with all the
+other Airflow metadata.
+
+After five failed logins in 40 seconds from one address, the login page
+stops for a short time (FAB rate limit).
+
+### 16.8 Install and start Caddy
+
+Install Caddy from the Caddy repository (the Ubuntu package is older):
+
+```bash
+sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
+sudo apt-get update
+sudo apt-get install -y caddy
+caddy version
+```
+
+The package starts Caddy with a sample page. Put the project configuration
+in place:
+
+```bash
+sudo cp ~/spp_data_pipeline/deploy/caddy/Caddyfile /etc/caddy/Caddyfile
+sudo install -d -o caddy -g caddy /var/log/caddy
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile   # "Valid configuration"
+sudo systemctl enable caddy
+sudo systemctl reload caddy
+```
+
+Optional: to get the Let's Encrypt expiry notices, edit
+`/etc/caddy/Caddyfile`, remove the `#` before `email` and write your
+address. Then validate and reload again.
+
+Look at the log until Caddy has the certificate (usually less than one
+minute):
+
+```bash
+sudo journalctl -u caddy -f
+# ... "certificate obtained successfully" ... "identifier":"etl.jmdajmda.com"
+```
+
+Press `Ctrl-c` to stop the log.
+
+### 16.9 Make sure that it works
+
+From **your computer** (not the VPS):
+
+```bash
+curl -sI http://etl.jmdajmda.com | head -n 3
+# HTTP/1.1 308 Permanent Redirect ... Location: https://etl.jmdajmda.com/
+curl -sS -o /dev/null -w '%{http_code}\n' https://etl.jmdajmda.com/api/v2/monitor/health   # 200
+curl -sS -o /dev/null -w '%{http_code}\n' https://etl.jmdajmda.com/api/v2/dags             # 401
+nc -vz -w 5 etl.jmdajmda.com 8080      # must fail (timeout or refused)
+```
+
+Then open `https://etl.jmdajmda.com` in a browser. Airflow shows the login
+page. Log in with the user from step 16.7.
+
+### 16.10 Later changes
+
+- **Change the Caddyfile:** edit `deploy/caddy/Caddyfile` in the repository,
+  get the code on the VPS, then:
+
+  ```bash
+  sudo cp ~/spp_data_pipeline/deploy/caddy/Caddyfile /etc/caddy/Caddyfile
+  sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+  sudo systemctl reload caddy
+  ```
+
+  The nightly deploy does not copy this file.
+- **Certificate renewal:** Caddy renews by itself. Ports 80 and 443 must stay
+  open.
+- **SSH tunnel (step 9):** a tunnel to `127.0.0.1:8080` still works, but
+  after a login Airflow goes to `https://etl.jmdajmda.com`. Use the public URL.
+- **Your computer (local development):** the same `docker-compose.override.yml`
+  applies. Add the three values to your local `.env` (see `.env.example`;
+  `AIRFLOW__API__BASE_URL=http://localhost:8080`, two secrets from
+  `openssl rand -hex 32`, no `COOKIE_SECURE`). Run `astro dev restart`, then
+  make a local user as in step 16.7. Open `http://localhost:8080`.
+
+### Why the extra files
+
+- **The Astro values win over `.env`.** The Astro CLI writes
+  `AIRFLOW__API__BASE_URL`, `AIRFLOW__API_AUTH__JWT_SECRET` and
+  `AIRFLOW__API__SECRET_KEY` into the `environment:` of each container, and
+  `environment:` has priority over `.env`. `docker-compose.override.yml`
+  removes them with `!reset null`, so the `.env` values apply. If a value is
+  missing in `.env`, Airflow makes a random key in each container: the login
+  and the tasks fail, but nobody can make a token.
+- **Astro Runtime bug.** The Astro Runtime image (3.3-7) has a middleware
+  that adds Astro scripts to each HTML page. It makes a new response and
+  drops the status code and the headers of the original. On the FAB login
+  page this drops the session cookie (the login always fails with "CSRF
+  session token is missing") and changes the redirect after the login into
+  an empty page. `plugins/astro_html_headers_fix.py` keeps the status code
+  and the headers. Remove the plugin when Astronomer fixes the bug.
+- **`airflow_settings.yaml` is empty.** `astro dev start` and
+  `astro dev restart` send the objects in this file to the Airflow API as
+  `admin:admin`. With a real login this fails, and then the command fails
+  (also the systemd unit and the nightly deploy). Set Variables with
+  `astro dev run variables set` (step 9).
+- **Proxy headers.** The API server runs with `--proxy-headers`, and FAB
+  with `enable_proxy_fix`. Airflow then knows that the browser uses HTTPS and
+  gives the login cookies the `Secure` flag. This trust is safe only because
+  port 8080 listens on `127.0.0.1` (step 16.4).
+
+### Troubleshooting
+
+| Problem | Possible cause | Action |
+|---|---|---|
+| Caddy log: `challenge failed`, `timeout` or `NXDOMAIN` | The DNS record is not there yet, it has the orange cloud, or port 80/443 is closed | Step 16.2 (`dig`), step 16.3 (`ufw` and the DigitalOcean firewall). Caddy tries again by itself. |
+| Caddy log: `CAA record ... prevents issuance` | A CAA record does not allow Let's Encrypt | Add the CAA record (step 16.2) |
+| Browser: `502 Bad Gateway` | Airflow does not run, or the API server is not on port 8080 | `astro dev ps`; `sudo ss -tlnp \| grep 8080` (step 16.4) |
+| After the login, the browser goes to `localhost:8080` | `AIRFLOW__API__BASE_URL` is not in `.env` | Step 16.5, then step 16.6 |
+| Login page: "CSRF session token is missing", or the login page opens again and again | The plugin is not loaded, or `COOKIE_SECURE=True` on plain HTTP | `astro dev run plugins \| grep spp_`; on your computer remove `AIRFLOW__FAB__COOKIE_SECURE` |
+| Tasks fail with `Invalid auth token` or `Signature verification failed`; the UI logs out after each click | A secret is missing or empty in `.env` | Step 16.5, then step 16.6 |
+| `astro dev start` or `restart` fails: `error adding variable` (401 or 403) | An entry in `airflow_settings.yaml` is not empty | Empty it; set the value with `astro dev run variables set` |
+| `nc` in step 16.9 connects to port 8080 | `airflow.expose_port` is `true` | Step 16.4, then `astro dev restart` |
+| `astro dev bash`: `airflow users` is not a command | The image has no FAB provider | `grep providers-fab requirements.txt`, then `astro dev restart` |
