@@ -32,6 +32,7 @@ For the VPS size, refer to README → [VPS configuration](README.md#vps-configur
 12. [Connect the Garden City device](#12-connect-the-garden-city-device)
 13. [Operation and maintenance](#13-operation-and-maintenance)
 14. [Troubleshooting](#14-troubleshooting)
+15. [Branches, CI and the nightly deploy](#15-branches-ci-and-the-nightly-deploy)
 
 ---
 
@@ -290,18 +291,19 @@ ssh -T git@github-spp
 
 ### 7.3 Clone the repository
 
-The default branch on GitHub is not `main`. Thus give the branch:
+The VPS runs the `prod` branch (step 15). The default branch on GitHub is
+`dev`, so give the branch:
 
 ```bash
 cd ~
-git clone -b main git@github-spp:akala47/spp_pipeline.git spp_data_pipeline
+git clone -b prod git@github-spp:akala47/spp_pipeline.git spp_data_pipeline
 cd ~/spp_data_pipeline
 git config pull.ff only           # a pull never makes a merge commit on the VPS
-git status                        # On branch main, up to date with 'origin/main'
+git status                        # On branch prod, up to date with 'origin/prod'
 ```
 
-To get the latest version later, run `git pull` in the project folder (refer
-to step 13, "Update the code").
+The nightly deploy (step 15) gets the later versions. Do not edit tracked
+files on the VPS: the deploy stops when it finds a changed file.
 
 ### 7.4 Set the configuration
 
@@ -683,7 +685,7 @@ documentation (`ssl_cert_file`, `ssl_key_file`).
    key for a repository.
 
    ```bash
-   git clone -b main git@github-spp:akala47/spp_pipeline.git spp_data_pipeline
+   git clone -b prod git@github-spp:akala47/spp_pipeline.git spp_data_pipeline
    cd spp_data_pipeline
    python3 -m venv .venv && .venv/bin/pip install -e '.[scada]'
    cp .env.example .env && chmod 600 .env
@@ -723,17 +725,24 @@ documentation (`ssl_cert_file`, `ssl_key_file`).
 
 ### Update the code
 
+The nightly deploy updates the code each night from the `prod` branch
+(step 15). It also updates the host virtual environment
+(`.venv/bin/pip install -e .`). To deploy now, without waiting for midnight:
+
 ```bash
 cd ~/spp_data_pipeline
-git pull --ff-only origin main   # uses the deploy key (step 7)
-astro dev restart                # rebuilds the image if requirements.txt or packages.txt changed
-.venv/bin/pip install -e .       # update the host virtual environment
+deploy/vps/deploy.sh --dry-run    # shows what it would do; changes nothing
+deploy/vps/deploy.sh --no-wait    # deploys now (does not wait for the quiet point)
 ```
 
-If `git pull` stops with "Not possible to fast-forward", a file on the VPS was
-changed. Do not edit tracked files on the VPS. To see the changes, run
-`git status`. To discard them, run `git restore .`, then pull again. `.env`
-is not tracked, so these commands do not change it.
+The script applies the same checks as the nightly run (green CI, schema
+patches, pre-flight) and rolls back if the health check fails. Do not use
+`git pull` + `astro dev restart` by hand: that skips the checks.
+
+If the deploy stops with "tracked files were changed on the VPS", a file on
+the VPS was changed. Do not edit tracked files on the VPS. To see the
+changes, run `git status`. To discard them, run `git restore .`. `.env` is
+not tracked, so these commands do not change it.
 
 To remove the access of a VPS, delete its key on GitHub (**Settings → Deploy
 keys**).
@@ -796,4 +805,236 @@ pg_restore -h localhost -U spp -d spp --clean --if-exists ~/backups/spp_<date>.d
 | Disk is almost full | Airflow task logs, Docker images, backups | Step 13: clean the logs; `docker system prune`; move old backups |
 | `git clone` or `git pull`: `Permission denied (publickey)` | The deploy key is not on GitHub, or the remote does not use `github-spp` | Do step 7.2 again. `git remote -v` must show `git@github-spp:akala47/spp_pipeline.git`. |
 | Tunnel to the UI: "connection reset" | The tunnel goes to a port where nothing listens (the Astro CLI does not use 8080), or the API server is not running yet | Step 9, "Open the Airflow UI": find the API server port with `astro dev ps` and tunnel to it |
-| `git clone` checks out the wrong branch | The default branch on GitHub is not `main` | Clone with `-b main`, or run `git checkout main` |
+| `git clone` checks out the wrong branch | The default branch on GitHub is `dev` | Clone with `-b prod`, or run `git checkout prod` |
+| The nightly deploy did not deploy | A gate stopped it | `tail -n 5 ~/.local/state/spp-deploy/history.tsv` shows the reason. Step 15, "Read the result" |
+
+## 15. Branches, CI and the nightly deploy
+
+### How it works
+
+| Branch | Use |
+|---|---|
+| `dev` | You develop and test here, on your computer. Default branch on GitHub. |
+| `prod` | What the VPS runs. Change it only by a pull request from `dev`. |
+
+`main`, `Upgrade-qa` and `working` are older branches. Nothing deploys them.
+
+1. You push to `dev`. GitHub Actions runs CI (`.github/workflows/ci.yml`):
+   - **pytest**: all the tests, with no database (`SPP_DSN` and
+     `SPP_TEST_DSN` are empty, so the database tests skip);
+   - **DAG import (Astro image)**: builds the Docker image from `Dockerfile`
+     and imports every file in `dags/` with the same Airflow as the VPS;
+   - **shellcheck deploy scripts**: lints `deploy/vps/*.sh` and runs
+     `deploy/vps/test_deploy.sh`. That script runs `deploy.sh` against a fake
+     `origin` with stub `astro`, `docker` and `curl`, through each path
+     (deploy, rollback, each gate). You can run it on your computer too.
+2. When CI is green, you open a pull request `dev` → `prod` and merge it.
+   CI runs again on the `prod` commit.
+3. At **00:00 Central** each night, the timer `spp-deploy.timer` on the VPS
+   starts `deploy/vps/deploy.sh`. The script:
+   1. Runs `git fetch origin prod`. If there is nothing new, it stops.
+   2. Checks the gates. If one gate fails, it skips the deploy, and Airflow
+      keeps running the old code:
+      - `prod` is a fast-forward of the commit on the VPS (no force push);
+      - the commit did not fail a deploy before;
+      - a `ci.yml` run **succeeded for this exact commit** (GitHub API);
+      - each new file in `schema/patches/` is in your list of applied
+        patches. The deploy never runs SQL. You apply patches yourself;
+      - **pre-flight**: the new Docker image builds, and every DAG file
+        imports in it. No restart happens yet.
+   3. Waits for the **quiet point**: 00:14:45. Then it runs
+      `git merge --ff-only` and `astro dev restart`.
+   4. Checks the health: the scheduler container runs, the scheduler job is
+      alive, there are no DAG import errors, and every DAG from the
+      pre-flight is loaded. The check waits up to 10 minutes.
+   5. If the health check fails, the script **rolls back** to the previous
+      commit, restarts again and checks again. It adds the failed commit to
+      `failed_shas`, so the next night does not try the same commit again.
+
+#### Why 00:14:45 and not 00:00
+
+No minute is free of work: `scada_beatrice` runs every minute, and each
+`scada_sherburne` run reads for about 14.5 minutes from :00, :15, :30 and
+:45. The least harmful moment is just after a Sherburne cycle stops reading
+(about :14:30). The RT runs at :12 are done by then, and the next RT runs are
+at :17. The slow work (fetch, CI check, image build) happens before this
+moment, so the restart itself is short (usually 1 to 3 minutes).
+
+**Expect each deploy to cost:** 1 to 3 Beatrice readings, and a late start
+of the 00:15 Sherburne cycle. The RT run at 00:17 can also start late.
+`spp_gap_sweeper` loads any RT file that a late run misses. `astro dev
+restart` stops the tasks that are running. If the pre-flight takes longer
+than 14 minutes (for example, a new package in `requirements.txt`), the
+script waits for the next quiet point (00:29:45). A night with nothing new
+on `prod` does not restart anything.
+
+To use a different quiet point, set `DEPLOY_QUIET_OFFSET` (seconds into each
+quarter hour; default `885`).
+
+### One-time setup on GitHub (on your computer)
+
+1. Make the branches from `main` and push them:
+
+   ```bash
+   git fetch origin
+   git branch prod origin/main
+   git branch dev origin/main
+   git push origin prod dev
+   ```
+
+2. Make `dev` the default branch:
+
+   ```bash
+   gh repo edit akala47/spp_pipeline --default-branch dev
+   ```
+
+3. Push a commit that contains `.github/workflows/ci.yml` to `dev`, and
+   merge it to `prod`. CI runs only after this file is on the branch.
+   Look at **Actions** on GitHub: the three jobs must be green.
+
+4. Protect `prod`: **Settings → Branches → Add branch ruleset** (or **Add
+   rule**), branch name `prod`:
+   - Require a pull request before merging.
+   - Require status checks to pass: `pytest`, `DAG import (Astro image)`,
+     `shellcheck deploy scripts`. These names appear after CI has run once.
+   - Block force pushes.
+
+5. Make a token for the CI gate. The repository is private, so the VPS needs
+   a token to read the CI results. **Settings (your account) → Developer
+   settings → Personal access tokens → Fine-grained tokens → Generate new
+   token**:
+   - Token name: `spp-vps-deploy`
+   - Expiration: the longest that you can use. Put the date in your
+     calendar. When the token expires, the deploys stop (the log shows
+     `GitHub API call failed`).
+   - Repository access: **Only select repositories** → `akala47/spp_pipeline`
+   - Permissions → Repository permissions → **Actions: Read-only**. Nothing
+     else (GitHub adds Metadata: Read-only).
+
+   Copy the token. You use it in the next part. Do not put it in the
+   repository or in `.env`.
+
+### One-time setup on the VPS (as `spp`)
+
+1. Move the checkout from `main` to `prod`:
+
+   ```bash
+   cd ~/spp_data_pipeline
+   git status                                   # must show no changed files
+   git fetch origin prod
+   git checkout -b prod --track origin/prod     # same commit as main: no restart needed
+   ```
+
+   If `prod` is ahead of what runs now, run `deploy/vps/deploy.sh --no-wait`
+   after step 3 instead of a manual restart.
+
+2. Put the token in the deploy configuration:
+
+   ```bash
+   mkdir -p ~/.config/spp-deploy && chmod 700 ~/.config/spp-deploy
+   ( umask 077; read -rsp 'GitHub token: ' t; echo; printf 'GITHUB_TOKEN=%s\n' "$t" > ~/.config/spp-deploy/deploy.env )
+   ```
+
+   Optional settings in the same file (one `KEY=value` per line; the file is
+   not run as shell code):
+
+   | Setting | Default | Use |
+   |---|---|---|
+   | `DEPLOY_QUIET_OFFSET` | `885` | Seconds into the quarter hour for the restart. `none` = at once. |
+   | `DEPLOY_HEALTH_TIMEOUT` | `600` | Seconds that the health check waits. |
+   | `DEPLOY_BRANCH` | `prod` | Branch to deploy. |
+   | `PROJECT_DIR` | `~/spp_data_pipeline` | Project folder. |
+
+3. Do a dry run. It fetches, checks CI and the patches, and builds the
+   image, but it does not restart Airflow:
+
+   ```bash
+   cd ~/spp_data_pipeline
+   deploy/vps/deploy.sh --dry-run
+   ```
+
+   With nothing new on `prod`, it shows `noop: already at origin/prod`.
+
+4. Install the timer:
+
+   ```bash
+   cp deploy/systemd/spp-deploy.service deploy/systemd/spp-deploy.timer ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now spp-deploy.timer
+   systemctl --user list-timers spp-deploy.timer     # NEXT shows the next 00:00 Central (in the VPS time zone)
+   ```
+
+   Linger must be on (step 9), or the timer does not run when you are not
+   logged in.
+
+### Daily work (on your computer)
+
+```bash
+git checkout dev
+# ... change and test ...
+SPP_DSN= SPP_TEST_DSN= pytest -q        # the same tests as CI, no database
+git push origin dev
+# when CI is green on dev:
+gh pr create --base prod --head dev --title "Release $(date +%F)" --fill
+gh pr merge --merge                      # after the checks pass
+```
+
+To run the database tests too, use a throwaway local Postgres. The script
+makes a new database in a temp folder (port 55432), loads
+`schema/01_schema.sql` and `02_seed.sql`, sets `SPP_DSN` and `SPP_TEST_DSN`
+to it, runs `pytest`, then deletes it. It needs the Postgres server programs
+(`brew install postgresql@16`; version 14 also works):
+
+```bash
+make test-local-db                                  # or: scripts/test_local_db.sh
+scripts/test_local_db.sh tests/test_scada.py -k mw  # pytest options
+KEEP_DB=1 scripts/test_local_db.sh                  # keep the database to look at it
+```
+
+> **WARNING:** `spp/config.py` reads `.env`. If your `.env` sets
+> `SPP_TEST_DSN`, a plain `pytest` runs the database tests against that
+> database, and the tests write to `SPP_DSN` when it is set. They write and
+> delete rows. Use `SPP_DSN= SPP_TEST_DSN= pytest` (no database) or
+> `make test-local-db`. Never put a Neon or VPS DSN in `SPP_TEST_DSN`.
+
+A schema change: put the SQL in `schema/patches/YYYY-MM-DD_name.sql`. Before
+the night of the deploy, apply it on the VPS, then tell the deploy:
+
+```bash
+cd ~/spp_data_pipeline
+set -a; . ./.env; set +a
+git fetch origin prod                    # the patch is on origin/prod, not yet in the folder
+git show origin/prod:schema/patches/YYYY-MM-DD_name.sql | psql "$SPP_DSN" -v ON_ERROR_STOP=1
+echo YYYY-MM-DD_name.sql >> ~/.local/state/spp-deploy/applied_patches
+```
+
+Until then, the deploy skips each night with `new schema patch(es) not
+applied`.
+
+### Read the result
+
+```bash
+tail -n 5 ~/.local/state/spp-deploy/history.tsv          # one line for each night
+tail -n 80 ~/.local/state/spp-deploy/deploy.log          # details
+journalctl --user -u spp-deploy.service -n 80 --no-pager
+systemctl --user --failed                                # shows spp-deploy.service after a rollback
+```
+
+| Result in `history.tsv` | Meaning | Action |
+|---|---|---|
+| `noop` | Nothing new on `prod` | None |
+| `deployed` | New code runs, health check OK | None |
+| `skipped` … `CI is not green` | CI failed, is still running, or did not run for the commit | Fix CI. A run that finishes after midnight deploys the next night. |
+| `skipped` … `schema patch` | A new patch is not in `applied_patches` | Apply it (above) |
+| `skipped` … `pre-flight failed` | The image does not build, or a DAG does not import | Fix on `dev`, merge again |
+| `skipped` … `failed a deploy before` | This commit was rolled back before | Push a fix. To try the same commit again, delete its line from `~/.local/state/spp-deploy/failed_shas`. |
+| `skipped` … `not a fast-forward` | Somebody force-pushed `prod` | Check `prod`. To take it for one run: `DEPLOY_ALLOW_NON_FF=1 deploy/vps/deploy.sh --no-wait` |
+| `rolled-back` (exit 1) | The new code failed the health check. The old code runs again. | Read `deploy.log`, fix on `dev` |
+| `rollback-failed` (exit 2) | The old code is not healthy either | Act now: step 9 "After a reboot" and `astro dev ps` |
+| `error` (exit 3) | Wrong branch, changed files on the VPS, or `git fetch` failed | Read the message |
+
+### Stop the nightly deploy
+
+```bash
+systemctl --user disable --now spp-deploy.timer
+```

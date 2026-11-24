@@ -1,0 +1,18 @@
+# systemd USER timer: start spp-deploy.service at midnight Central each day.
+# The deploy script does the slow work first (fetch, CI check, image build,
+# DAG import check), then waits for the quiet point (00:14:45 by default,
+# when the 00:00 Sherburne cycle has stopped reading) before it restarts
+# Airflow. See DEPLOY_VPS.md, step 15.
+[Unit]
+Description=SPP data pipeline: nightly deploy at 00:00 America/Chicago
+
+[Timer]
+OnCalendar=*-*-* 00:00:00 America/Chicago
+# A missed midnight (VPS off) is not made up at boot: the boot already starts
+# Airflow, and a deploy then would restart it again.
+Persistent=false
+AccuracySec=1s
+Unit=spp-deploy.service
+
+[Install]
+WantedBy=timers.target

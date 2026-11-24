@@ -1,0 +1,30 @@
+# systemd USER unit: one nightly deploy of the prod branch. Started by
+# spp-deploy.timer. See DEPLOY_VPS.md, step 15.
+#
+#   cp deploy/systemd/spp-deploy.service deploy/systemd/spp-deploy.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now spp-deploy.timer
+#
+# Run one deploy now (it still waits for the quiet point):
+#   systemctl --user start spp-deploy.service
+# Log:
+#   journalctl --user -u spp-deploy.service -n 100 --no-pager
+#   tail -n 100 ~/.local/state/spp-deploy/deploy.log
+#
+# The script reads GITHUB_TOKEN and optional overrides from
+# ~/.config/spp-deploy/deploy.env (chmod 600).
+[Unit]
+Description=SPP data pipeline: nightly deploy of the prod branch
+After=spp-airflow.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/spp_data_pipeline
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PROJECT_DIR=%h/spp_data_pipeline
+ExecStart=%h/spp_data_pipeline/deploy/vps/deploy.sh
+# Pre-flight image build + wait for the quiet point + restart + health check,
+# and the same again for a rollback.
+TimeoutStartSec=2h
+# Exit 1 (rolled back) and 2 (rollback failed) mark the unit as failed, so
+# `systemctl --user --failed` shows them.
