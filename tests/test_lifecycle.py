@@ -154,6 +154,24 @@ def test_spine_id_sql_matches_python(conn):
         assert stored == computed == spine_id(ts)
 
 
+def test_spine_id_sql_matches_python_across_years(conn):
+    """SQL spine_id() and spp.spine agree over many years, month and year ends."""
+    from spp.spine import spine_id
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT g, spine_id(g) FROM generate_series("
+            "  TIMESTAMP '1999-12-31 23:55', TIMESTAMP '2031-01-01', "
+            "  interval '7 hours 13 minutes') g "
+            "UNION ALL SELECT g, spine_id(g) FROM unnest(ARRAY["
+            "  TIMESTAMP '2026-12-31 23:55', TIMESTAMP '2027-01-01 00:00',"
+            "  TIMESTAMP '2028-02-29 12:05', TIMESTAMP '2026-11-01 01:30']) g")
+        rows = cur.fetchall()
+    assert len(rows) > 30_000
+    for ts, computed in rows:
+        assert computed == spine_id(ts)
+
+
 def test_fact_rows_carry_spine_id(conn):
     from spp.spine import spine_id
 
@@ -162,7 +180,7 @@ def test_fact_rows_carry_spine_id(conn):
         cur.execute("SELECT timestamp_id FROM rt_lmp WHERE settlement_location = %s",
                     (NODE,))
         (tid,) = cur.fetchone()
-    assert tid == spine_id(D0 + timedelta(hours=17, minutes=45)) == "46225HB17MB45"
+    assert tid == spine_id(D0 + timedelta(hours=17, minutes=45)) == "20260722HB17MB45"
 
 
 # --------------------------------------------------------------------------- #
@@ -182,8 +200,8 @@ def test_rt_partitions_are_bounded_by_spine_id(conn):
         cur.execute("SELECT pg_get_expr(c.relpartbound, c.oid) FROM pg_class c "
                     "WHERE c.relname = 'rt_lmp_y2026m07'")
         (bound,) = cur.fetchone()
-    # July 2026 = Excel 46204 (Jul 1) .. 46235 (Aug 1)
-    assert bound == "FOR VALUES FROM ('46204HB00MB00') TO ('46235HB00MB00')"
+    # July 2026 = Jul 1 00:00 .. Aug 1 00:00
+    assert bound == "FOR VALUES FROM ('20260701HB00MB00') TO ('20260801HB00MB00')"
 
 
 def test_query_by_spine_id_prunes_to_one_partition(conn):
@@ -242,5 +260,5 @@ def test_coverage_counts_by_spine_id(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM rt_lmp WHERE settlement_location = %s "
                     "AND timestamp_id >= %s AND timestamp_id < %s",
-                    (NODE, "46225HB00MB00", "46225HB00MB10"))
+                    (NODE, "20260722HB00MB00", "20260722HB00MB10"))
         assert cur.fetchone()[0] == 2

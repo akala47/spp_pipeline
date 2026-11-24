@@ -48,10 +48,10 @@ def test_sanity_check(text):
 # readings -> spine ids
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("ts, want", [
-    (datetime(2026, 9, 3, 10, 47, 11, 300000), "46268HB10MB45"),
-    (datetime(2026, 9, 3, 10, 49, 59, 999999), "46268HB10MB45"),
-    (datetime(2026, 9, 3, 10, 50, 0), "46268HB10MB50"),
-    (datetime(2026, 9, 3, 0, 4, 59), "46268HB00MB00"),
+    (datetime(2026, 9, 3, 10, 47, 11, 300000), "20260903HB10MB45"),
+    (datetime(2026, 9, 3, 10, 49, 59, 999999), "20260903HB10MB45"),
+    (datetime(2026, 9, 3, 10, 50, 0), "20260903HB10MB50"),
+    (datetime(2026, 9, 3, 0, 4, 59), "20260903HB00MB00"),
 ])
 def test_reading_gets_its_interval_id(ts, want):
     r = Reading("BEATRICE", ts, Decimal("33.372"))
@@ -63,7 +63,7 @@ def test_a_minute_cadence_gives_five_readings_per_id():
     start = datetime(2026, 9, 3, 10, 45, 11)
     ids = [Reading("BEATRICE", start + timedelta(minutes=i), Decimal(1)).timestamp_id
            for i in range(10)]
-    assert ids == ["46268HB10MB45"] * 5 + ["46268HB10MB50"] * 5
+    assert ids == ["20260903HB10MB45"] * 5 + ["20260903HB10MB50"] * 5
 
 
 def test_aware_read_time_becomes_central_wall_clock():
@@ -74,7 +74,7 @@ def test_aware_read_time_becomes_central_wall_clock():
                            datetime(2026, 11, 2, 15, 47, 11, tzinfo=timezone.utc),
                            Decimal("33.372"))
     assert r.reading_timestamp == datetime(2026, 11, 2, 9, 47, 11)
-    assert r.timestamp_id == "46328HB09MB45"
+    assert r.timestamp_id == "20261102HB09MB45"
     with pytest.raises(ValueError):
         Reading.from_aware("BEATRICE", datetime(2026, 11, 2, 9, 47), Decimal(1))
 
@@ -159,7 +159,7 @@ def test_to_readings_keeps_good_values_and_reports_bad_ones(monkeypatch):
         {"GC_LEWIS": "3.2105 MW", "GC_JAMESON": "###.#",
          "GC_TOTAL": NoSuchElementException("gone")}, at)
     assert [(r.location, r.mw_reading, r.timestamp_id) for r in readings] == [
-        ("GC_LEWIS", Decimal("3.211"), "46334HB10MB45")]
+        ("GC_LEWIS", Decimal("3.211"), "20261108HB10MB45")]
     assert isinstance(errors["GC_JAMESON"], garden_city.ReadingUnavailable)
     assert isinstance(errors["GC_TOTAL"], NoSuchElementException)
 
@@ -326,7 +326,7 @@ def test_legacy_row_with_header():
     r = parse_row(row, CENTRAL)
     assert (r.location, r.reading_timestamp, r.mw_reading, r.timestamp_id) == (
         "BEATRICE", datetime(2026, 10, 19, 10, 47, 11, 300000),
-        Decimal("33.372"), "46314HB10MB45")
+        Decimal("33.372"), "20261019HB10MB45")
 
 
 def test_legacy_row_without_header_any_column_order():
@@ -402,7 +402,7 @@ def test_write_is_idempotent_and_groups_by_interval(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT timestamp_id, count(*) FROM mw_updates "
                     "WHERE location = %s GROUP BY 1 ORDER BY 1", (LOC,))
-        assert cur.fetchall() == [("46225HB10MB45", 5), ("46225HB10MB50", 2)]
+        assert cur.fetchall() == [("20260722HB10MB45", 5), ("20260722HB10MB50", 2)]
 
 
 @db_only
@@ -412,7 +412,7 @@ def test_table_rejects_a_mismatched_timestamp_id(conn):
     with pytest.raises(psycopg2.errors.CheckViolation):
         with conn.cursor() as cur:
             cur.execute("INSERT INTO mw_updates VALUES (%s, %s, %s, %s)",
-                        ("46225HB10MB50", LOC, T0, 1))     # T0 is in MB45
+                        ("20260722HB10MB50", LOC, T0, 1))     # T0 is in MB45
 
 
 @db_only

@@ -6,7 +6,7 @@
 -- To start again on a dev database, run schema/00_reset_dev.sql first.
 -- There is no migration chain: this file is the full schema.
 --
--- QUERYING: timestamp_id (the spine id, e.g. '46268HB17MB45') is the access
+-- QUERYING: timestamp_id (the spine id, e.g. '20260903HB17MB45') is the access
 -- path for every fact table. Apps calculate the id bounds (spp/spine.py, or
 -- spine_id() in SQL) and filter
 --     WHERE timestamp_id BETWEEN :first AND :last [AND <node/zone/location> = :x]
@@ -28,15 +28,21 @@ BEGIN;
 -- Provenance : Published/Forward Filled
 CREATE TYPE value_source AS ENUM ('published', 'forward_filled');
 
--- SPINE_ID — the timestamps key: '<excel date serial>HB<hh>MB<mm>'.
---     2026-09-03 17:45  ->  '46268HB17MB45'
--- The Excel serial is days since 1899-12-30 (Excel's effective epoch). Hour and
--- minute are zero-padded, so ids are fixed-width and sort / BETWEEN-filter in
--- time order as text. IMMUTABLE so it can drive a generated column.
+-- SPINE_ID — the timestamps key: '<YYYYMMDD>HB<hh>MB<mm>', Central wall clock,
+-- interval beginning.
+--     2026-09-03 17:45  ->  '20260903HB17MB45'
+-- Date, hour and minute are zero-padded, so ids are fixed-width (16 characters)
+-- and sort / BETWEEN-filter in time order as text. Built from extract(), not
+-- to_char(): to_char is only STABLE, and the generated column needs an
+-- IMMUTABLE expression. (Until 2026-11 the date part was the Excel date serial,
+-- e.g. '46268HB17MB45'; schema/patches/2026-11-23_spine_id_yyyymmdd.sql
+-- rewrites a database that has those.)
 -- Python twin: spp/spine.py — keep the two identical.
 CREATE FUNCTION spine_id(ts timestamp) RETURNS text
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT (ts::date - DATE '1899-12-30')::text
+    SELECT lpad((extract(year  FROM ts)::int * 10000
+               + extract(month FROM ts)::int * 100
+               + extract(day   FROM ts)::int)::text, 8, '0')
         || 'HB' || lpad(extract(hour   FROM ts)::int::text, 2, '0')
         || 'MB' || lpad(extract(minute FROM ts)::int::text, 2, '0')
 $$;
@@ -82,7 +88,7 @@ CREATE INDEX timestamps_hour_start_idx ON timestamps (ts_central) WHERE is_hour_
 -- RT LMP — real-time locational marginal price, 5-min, by settlement location.
 -- RANGE-partitioned monthly on timestamp_id. Ids are fixed-width and
 -- time-ordered, so a month is the id range [first day 00:00, next month 00:00),
--- e.g. September 2026 = ['46266HB00MB00', '46296HB00MB00'). Partitions are
+-- e.g. September 2026 = ['20260901HB00MB00', '20261001HB00MB00'). Partitions are
 -- created just in time by ensure_month_partition() (011).
 CREATE TABLE rt_lmp (
     id                  bigint GENERATED ALWAYS AS IDENTITY,
@@ -253,7 +259,7 @@ CREATE INDEX mw_updates_loc_ts_idx ON mw_updates (location, timestamp_id)
 -- table that is partitioned on timestamp_id, if it does not exist. The loader
 -- calls it before each write, so no cron job is necessary. A month is the
 -- spine id range [first day 00:00, first day of next month 00:00), e.g.
--- September 2026 = ['46266HB00MB00', '46296HB00MB00'). Name: <parent>_yYYYYmMM.
+-- September 2026 = ['20260901HB00MB00', '20261001HB00MB00'). Name: <parent>_yYYYYmMM.
 CREATE FUNCTION ensure_month_partition(p_parent text, p_month date)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
