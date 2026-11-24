@@ -10,3 +10,6 @@ python-dotenv>=1.0
 #apache-airflow~=3.3.1
 pandas~=3.0.5
 selenium>=4.20
+# Login for the Airflow UI (FAB auth manager; docker-compose.override.yml).
+# Not in the Astro Runtime image. 3.11.1 installs with no change to Airflow.
+apache-airflow-providers-fab~=3.11
