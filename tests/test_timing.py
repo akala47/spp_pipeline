@@ -43,7 +43,7 @@ def test_rt_lmp_minus_five_minutes():
     row = FEEDS["rt_lmp"].parse(RT_LMP, datetime(2026, 11, 1, 10, 35), NODE)[0]
     assert row["interval_central"] == datetime(2026, 11, 1, 10, 35)
     assert row["gmt_interval_begin"] == datetime(2026, 11, 1, 16, 35)
-    assert spine_id(row["interval_central"]) == "46327HB10MB35"
+    assert spine_id(row["interval_central"]) == "20261101HB10MB35"
 
 
 def test_rt_mcp_minus_five_minutes():
@@ -57,7 +57,7 @@ def test_da_lmp_minus_one_hour_he01_is_hb00():
         datetime(2026, 11, 2, 0, 0),       # HE 01:00 -> HB 00:00
         datetime(2026, 11, 2, 23, 0),      # HE 24:00 (next day 00:00) -> HB 23:00
     ]
-    assert spine_id(rows[0]["interval_central"]) == "46328HB00MB00"
+    assert spine_id(rows[0]["interval_central"]) == "20261102HB00MB00"
 
 
 def test_hourly_load_long_format_is_gmt_cdt():
@@ -72,7 +72,7 @@ def test_hourly_load_long_format_is_gmt_cdt():
         datetime(2026, 10, 31, 0, 0), datetime(2026, 10, 31, 23, 0)]
     assert rows[0]["gmt_interval_begin"] == datetime(2026, 10, 31, 5, 0)
     assert rows[0]["nppd"] == 105
-    assert spine_id(rows[0]["interval_central"]) == "46326HB00MB00"
+    assert spine_id(rows[0]["interval_central"]) == "20261031HB00MB00"
 
 
 def test_hourly_load_long_format_is_gmt_cst():

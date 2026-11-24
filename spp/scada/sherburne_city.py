@@ -43,8 +43,8 @@ DATABASE CONTRACT (schema/01_schema.sql in the pipeline repository). Each
 reading is one row of mw_updates:
 
     timestamp_id       spine id of the 5-minute interval that contains the
-                       reading: '<Excel date serial>HB<hh>MB<mm>', Central
-                       wall clock, e.g. 10:47:11 on 2026-11-08 -> '46334HB10MB45'
+                       reading: '<YYYYMMDD>HB<hh>MB<mm>', Central wall
+                       clock, e.g. 10:47:11 on 2026-11-08 -> '20261108HB10MB45'
     location           SHERBURNE_CITY | SHERBURNE_CITY_PEAK (rows of
                        scada_locations)
     reading_timestamp  Central wall-clock read time, without a time zone
@@ -80,7 +80,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
@@ -191,12 +191,9 @@ def load_env_file() -> None:
 # --------------------------------------------------------------------------- #
 # TRANSFORM: spine id, reading, parsing (same as garden_city.py)
 # --------------------------------------------------------------------------- #
-EXCEL_EPOCH = date(1899, 12, 30)
-
-
 def spine_id(ts: datetime) -> str:
-    """Interval-beginning Central wall clock -> '46268HB17MB45'."""
-    return f"{(ts.date() - EXCEL_EPOCH).days}HB{ts.hour:02d}MB{ts.minute:02d}"
+    """Interval-beginning Central wall clock -> '20260903HB17MB45'."""
+    return f"{ts.year:04d}{ts.month:02d}{ts.day:02d}HB{ts.hour:02d}MB{ts.minute:02d}"
 
 
 def interval_begin(ts: datetime, minutes: int = 5) -> datetime:
