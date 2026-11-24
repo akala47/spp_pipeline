@@ -124,7 +124,7 @@ Install Docker and the [Astro CLI](https://www.astronomer.io/docs/astro/cli/inst
 Airflow runs in containers. You do not need a local Airflow.
 
 ```bash
-git clone -b main git@github.com:akala47/spp_pipeline.git spp_data_pipeline && cd spp_data_pipeline
+git clone -b dev git@github.com:akala47/spp_pipeline.git spp_data_pipeline && cd spp_data_pipeline   # develop on dev; the VPS runs prod (DEPLOY_VPS.md, step 15)
 cp .env.example .env          # then set SPP_DSN and the SCADA values
 ```
 
