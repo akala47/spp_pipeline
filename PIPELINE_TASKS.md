@@ -69,8 +69,8 @@ Do not use `logical_date`. In Airflow 3 it is `None` for a manual run.
 
 - **Interval-beginning.** SPP publishes interval-ending times. Each parser
   subtracts one period: 5 minutes for RT, 1 hour for DA and hourly load.
-- **Spine ids.** `<Excel date serial>HB<hh>MB<mm>` of the interval-beginning
-  Central time. `46268HB17MB45` is 2026-09-03 17:45.
+- **Spine ids.** `<YYYYMMDD>HB<hh>MB<mm>` of the interval-beginning
+  Central time. `20260903HB17MB45` is 2026-09-03 17:45.
 - **RT file names.** SPP names an RT file with the interval-ending time. The
   URL builder adds 5 minutes. The file of the interval that ends at midnight
   is in the folder of the previous day.

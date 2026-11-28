@@ -12,9 +12,9 @@ device, because the Garden City HMI is only available through the site VPN.
 All writes are upserts. You can run a job again for the same time and you do
 not get duplicate rows.
 
-All tables use one time key: the **spine id**. It is the same Excel-based ID
-that our internal files use, so data that you download from the dashboard
-agrees with those files. Refer to [Time conventions](#time-conventions).
+All tables use one time key: the **spine id**, for example
+`20260903HB17MB45` for 2026-09-03 17:45 Central. Refer to
+[Time conventions](#time-conventions).
 
 | Feed | Table | Cadence | Published by the source |
 |---|---|---|---|
@@ -62,14 +62,17 @@ different place.
 format:
 
 ```
-<Excel date serial>HB<hour-beginning>MB<minute-beginning>
-46268HB17MB45   = 2026-09-03 17:45, Central
+<YYYYMMDD>HB<hour-beginning>MB<minute-beginning>
+20260903HB17MB45   = 2026-09-03 17:45, Central
 ```
 
-- The Excel serial is the number of days from 1899-12-30. This is the same
-  number that Excel shows for a date.
-- The hour and the minute have two digits. Thus all ids have the same length,
-  and the text order of the ids is the time order.
+- The date is the Central calendar date of the interval beginning.
+- The date, the hour and the minute are zero-padded. Thus all ids have the
+  same length (16 characters), and the text order of the ids is the time
+  order.
+- Until 2026-11 the date part was the Excel date serial (`46268HB17MB45`).
+  `schema/patches/2026-11-23_spine_id_yyyymmdd.sql` changes a database that
+  has the old ids. Refer to [Change the spine id format](#change-the-spine-id-format).
 - Postgres calculates the id with the SQL function `spine_id()`.
   `spp/spine.py` is the Python copy (`spine_id`, `parse_spine_id`). The two
   must always give the same result. `tests/test_lifecycle.py` compares them.
@@ -124,7 +127,7 @@ Install Docker and the [Astro CLI](https://www.astronomer.io/docs/astro/cli/inst
 Airflow runs in containers. You do not need a local Airflow.
 
 ```bash
-git clone -b main git@github.com:akala47/spp_pipeline.git spp_data_pipeline && cd spp_data_pipeline
+git clone -b dev git@github.com:akala47/spp_pipeline.git spp_data_pipeline && cd spp_data_pipeline   # develop on dev; the VPS runs prod (DEPLOY_VPS.md, step 15)
 cp .env.example .env          # then set SPP_DSN and the SCADA values
 ```
 
@@ -328,7 +331,7 @@ use the field value. For development, set `SPP_LOG_FORMAT=text`.
 
 - **Bounds.** A month is the spine id range from the first day at 00:00 to the
   first day of the next month at 00:00. For example, September 2026 is
-  `['46266HB00MB00', '46296HB00MB00')`. The ids have a fixed length, so the
+  `['20260901HB00MB00', '20261001HB00MB00')`. The ids have a fixed length, so the
   text range is the same as the time range.
 - **Names.** `<table>_yYYYYmMM`, for example `rt_lmp_y2026m09`.
 - **Creation.** `02_seed.sql` makes the partitions for the seed range.
@@ -391,6 +394,27 @@ use the field value. For development, set `SPP_LOG_FORMAT=text`.
   must show only the partitions in your range and an `Index Only Scan` (or
   `Index Scan`).
 
+### Change the spine id format
+
+A database built before 2026-11-23 has Excel-serial ids (`46268HB17MB45`).
+`schema/patches/2026-11-23_spine_id_yyyymmdd.sql` changes it to YYYYMMDD ids
+(`20260903HB17MB45`) in one transaction: it replaces `spine_id()`, rewrites
+`timestamps.id` and the `timestamp_id` of every table, re-attaches each
+monthly partition with new bounds, and checks the row counts. It is safe to
+run again. Old code writes old ids, and the database then rejects them.
+Thus, do the steps in this order:
+
+1. Stop every writer: Airflow (`astro dev stop`), the Garden City scraper
+   (launchd on its device) and the Sherburne scraper (its Windows device).
+2. Make a backup (`pg_dump -Fc`).
+3. Run the patch:
+   `psql "$SPP_DSN" -v ON_ERROR_STOP=1 -f schema/patches/2026-11-23_spine_id_yyyymmdd.sql`
+4. Deploy the new code, and copy the new `garden_city.py` and
+   `sherburne_city.py` to their devices. Change all apps that read the
+   database and calculate ids (for example the dashboard) at the same time.
+5. Start the writers again. Then run `VACUUM (ANALYZE)` on the fact tables:
+   the patch rewrites each row.
+
 ## Querying
 
 Query the fact tables by `timestamp_id`.
@@ -401,8 +425,8 @@ Query the fact tables by `timestamp_id`.
    ```python
    from datetime import datetime
    from spp.spine import spine_id, parse_spine_id
-   first = spine_id(datetime(2026, 9, 3, 0, 0))    # '46268HB00MB00'
-   last  = spine_id(datetime(2026, 9, 3, 23, 55))  # '46268HB23MB55'
+   first = spine_id(datetime(2026, 9, 3, 0, 0))    # '20260903HB00MB00'
+   last  = spine_id(datetime(2026, 9, 3, 23, 55))  # '20260903HB23MB55'
    ```
 
    In SQL: `spine_id('2026-09-03 00:00'::timestamp)`.
@@ -420,7 +444,7 @@ Query the fact tables by `timestamp_id`.
    SELECT * FROM rt_mcp WHERE timestamp_id BETWEEN :first AND :last;
 
    -- one hour
-   SELECT * FROM hourly_load WHERE timestamp_id = '46268HB17MB00';
+   SELECT * FROM hourly_load WHERE timestamp_id = '20260903HB17MB00';
 
    -- one SCADA site over time
    SELECT reading_timestamp, mw_reading FROM mw_updates

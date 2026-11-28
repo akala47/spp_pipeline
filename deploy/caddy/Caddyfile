@@ -1,0 +1,44 @@
+# Caddy: public HTTPS for the Airflow UI. See DEPLOY_VPS.md, step 16.
+#
+# Install on the VPS:
+#   sudo cp ~/spp_data_pipeline/deploy/caddy/Caddyfile /etc/caddy/Caddyfile
+#   sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+#   sudo systemctl reload caddy
+#
+# - Caddy gets and renews the Let's Encrypt certificate by itself. The DNS
+#   record of etl.jmdajmda.com must point at this VPS, and ports 80 and 443
+#   must be open, before Caddy can get it.
+# - Port 80 only redirects to HTTPS (and answers the Let's Encrypt HTTP
+#   challenge). Caddy does this by itself for a site with a domain name.
+# - The Airflow API server listens on 127.0.0.1:8080 only (Astro CLI with
+#   airflow.expose_port=false). Port 8080 is not open to the internet.
+# - Airflow asks for the login (FAB auth manager). Caddy adds no password.
+{
+	# Optional: an address for Let's Encrypt expiry notices. Remove the #.
+	# email you@example.com
+}
+
+etl.jmdajmda.com {
+	encode zstd gzip
+
+	header {
+		# Browsers use only HTTPS for this host name for one year.
+		# Not includeSubDomains: other hosts of jmdajmda.com are not changed.
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Caddy sets X-Forwarded-For, X-Forwarded-Proto (https) and
+	# X-Forwarded-Host. Airflow uses them because the API server runs with
+	# --proxy-headers (docker-compose.override.yml).
+	reverse_proxy 127.0.0.1:8080
+
+	log {
+		output file /var/log/caddy/etl.jmdajmda.com.access.log {
+			roll_size 20MiB
+			roll_keep 5
+		}
+	}
+}

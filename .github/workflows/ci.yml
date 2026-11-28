@@ -1,0 +1,79 @@
+# CI for the SPP data pipeline.
+#
+# Runs on every push to dev and prod, and on pull requests into them.
+# The nightly deploy on the VPS (deploy/vps/deploy.sh) takes a prod commit
+# only when a run of THIS workflow (ci.yml) succeeded for that exact commit,
+# so keep the file name, or change DEPLOY_CI_WORKFLOW on the VPS too.
+#
+# No database: SPP_DSN and SPP_TEST_DSN are empty, so the database tests skip.
+name: CI
+
+on:
+  push:
+    branches: [dev, prod]
+  pull_request:
+    branches: [dev, prod]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SPP_DSN: ""
+  SPP_TEST_DSN: ""
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"     # same as the Astro runtime 3.3 image
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt lxml
+
+      - name: pytest (no database)
+        run: pytest -q -rs
+
+  dag-import:
+    name: DAG import (Astro image)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the Astro runtime image
+        run: docker build -t spp-ci:${{ github.sha }} .
+
+      - name: Import every DAG file
+        run: |
+          docker run --rm \
+            -v "$PWD/dags:/usr/local/airflow/dags:ro" \
+            spp-ci:${{ github.sha }} \
+            python /usr/local/airflow/deploy/check_dag_imports.py
+
+  check-deploy-script:
+    name: shellcheck deploy scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: shellcheck
+        run: shellcheck deploy/vps/*.sh
+      - name: deploy.sh scenarios (stub astro/docker/curl, fake origin)
+        run: deploy/vps/test_deploy.sh

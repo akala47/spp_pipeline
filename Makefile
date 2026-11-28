@@ -1,4 +1,4 @@
-.PHONY: install schema seed reset-dev test test-db smoke
+.PHONY: install schema seed reset-dev test test-db test-local-db smoke
 
 # Seed range for `make seed` / `make reset-dev`. Override on the command line:
 #   make seed SEED_FROM=2026-01-01 SEED_TO=2026-12-31
@@ -26,6 +26,11 @@ reset-dev:
 
 test:
 	pytest -q
+
+# All tests, database tests included, on a throwaway local Postgres
+# (never the DSNs in .env). Needs initdb/pg_ctl: brew install postgresql@16
+test-local-db:
+	scripts/test_local_db.sh
 
 test-db:
 	SPP_TEST_DSN="$(SPP_TEST_DSN)" pytest -q
