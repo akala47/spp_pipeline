@@ -676,8 +676,8 @@ def test_sherburne_cycle_logs_in_once_and_reads_each_minute(monkeypatch):
     assert sc.run_cycle(writer, reads=3) == 3
     assert driver.visited == ["https://portal/login"] and driver.logins == 1
     assert driver.typed == {"email": "ops@example.com", "password": "pw\ue006"}
-    assert driver.current_window_handle.startswith("graphs-tab")
-    # Each tick writes site load and town peak (same kW display -> MW).
+    assert driver.current_window_handle == "main"      # dashboard: no new tab
+    # Each tick writes Current Demand and Monthly Peak (same kW display -> MW).
     assert [r.mw_reading for r in got] == [
         Decimal("21.500"), Decimal("21.500"),
         Decimal("21.640"), Decimal("21.640"),
@@ -720,7 +720,7 @@ def test_sherburne_login_link_on_a_live_session_skips_the_form(monkeypatch):
     driver.logged_in = True                           # session still valid
     driver.get("https://portal/login")
     sc.login(driver)
-    assert driver.typed == {} and driver.page == "home"
+    assert driver.typed == {} and driver.page == "dashboard"
 
 
 def test_sherburne_bad_login_is_reported(monkeypatch):
